@@ -463,6 +463,13 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
     }
 }
 
+static inline float dsv41_bf16(float x) {
+    uint bits = as_type<uint>(x);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return as_type<float>(bits & 0xffff0000u);
+}
+
 // Decode shared-expert gate/up projections followed by SwiGLU:
 //
 //     mid = silu(min(gate, limit)) * clamp(up, -limit, limit)
@@ -473,7 +480,7 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
 // same lane that owns the reduced output row.  The point is not to fuse two
 // independent weight streams into one matmul; it is to remove the separate
 // activation pass and its reread of the two 2048-wide rows.
-template<short NR0, bool STORE_GATE_UP>
+template<short NR0, bool STORE_GATE_UP, bool BF16 = false>
 void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0_gate,
@@ -584,14 +591,14 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
                 gate_f32[out_row] = gate;
                 up_f32[out_row] = up;
             }
-            float g = gate;
-            float u = up;
+            float g = BF16 ? dsv41_bf16(gate) : gate;
+            float u = BF16 ? dsv41_bf16(up) : up;
             if (clamp_value > 1.0e-6f) {
                 g = min(g, clamp_value);
                 u = clamp(u, -clamp_value, clamp_value);
             }
             const float silu = g / (1.0f + exp(-g));
-            mid_f32[out_row] = silu * u;
+            mid_f32[out_row] = BF16 ? dsv41_bf16(silu * u) : silu * u;
         }
     }
 }
@@ -611,6 +618,25 @@ kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, true>(
+            args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
+            clamp_value, shmem, tgpig, tiisg, sgitg);
+}
+
+// V4.1 rounds gate, up and the SwiGLU output to BF16.
+kernel void kernel_dsv41_shared_gate_up_swiglu_q8_0(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        constant     float &clamp_value,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, false, true>(
             args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }

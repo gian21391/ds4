@@ -41647,6 +41647,18 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         if (shared_queued && balance_shared) shared_here = true;
     }
 #endif
+#ifdef __APPLE__
+    if (g->tp_world < 2 && !g->streaming &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_down_shexp->type == DS4_TENSOR_Q8_0) {
+        shared_queued = ds4_gpu_dsv41_shared_start(g->shared, g->shared_gate,
+            g->shared_up, g->shared_mid, g->norm, m->map, m->size,
+            l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+            l->ffn_down_shexp->abs_offset, DS4_N_EMBD, DS4_N_FF_EXP,
+            DS4_SWIGLU_CLAMP_EXP, NULL) > 0;
+    }
+#endif
     if (shared_here && !shared_queued &&
         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
         !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
@@ -41673,8 +41685,11 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g->selected, g->route_weights,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->norm, NULL, il,
             !g->streaming);
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#ifndef DS4_ROCM_BUILD
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
+#endif
+#ifdef __APPLE__
+    if (shared_queued && !ds41_bf16(g->shared, DS4_N_EMBD)) return false;
 #endif
     if (!routed_ok) return false;
     /* The balanced path writes zero on the non-owning rank. Keep the shared

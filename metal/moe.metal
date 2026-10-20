@@ -3623,14 +3623,10 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     float sumu[N_R0_IQ2_XXS] = {0.f};
 
     threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
-    threadgroup uint8_t  *ssigns  = (threadgroup uint8_t *)(svalues + 256);
     {
         int nval = 4;
         int pos = (32 * sgitg + tiisg) * nval;
         for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -3665,8 +3661,10 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
             for (short l = 0; l < 4; ++l) {
                 const threadgroup uint8_t *gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
                 const threadgroup uint8_t *gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
-                const uint8_t signg = ssigns[(aux32g >> 7 * l) & 127];
-                const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
+                const uint ig = (aux32g >> 7 * l) & 127;
+                const uint8_t signg = ig | ((popcount(ig) & 1) << 7);
+                const uint iu = (aux32u >> 7 * l) & 127;
+                const uint8_t signu = iu | ((popcount(iu) & 1) << 7);
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8 * l + j];
                     sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
@@ -5926,14 +5924,14 @@ kernel void kernel_mul_mv_id_q2_K_sum6_f32(
     const short ir = it%4;
     const short is = (8*ir)/16;
 
-    for (int expert_slot = 0; expert_slot < args.nei0; expert_slot++) {
+    for (int u = ix; u < args.nei0 * nb; u += 4) {
+        const int expert_slot = u / nb;
+        const int ib = u - expert_slot * nb;
         const int32_t expert = token_ids[expert_slot];
         if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
         device const block_q2_K * x = (device const block_q2_K *)(src0s + (int64_t)(expert - args.tp_expert_base)*args.nb02 + first_row*args.nb01);
-        device const float * y = (device const float *)(token_src1 + expert_slot*args.nb11);
-        device const float * y4 = y + ix * QK_K + 128 * iq + 8 * ir;
-
-        for (int ib = ix; ib < nb; ib += 4) {
+        device const float * y4 = (device const float *)(token_src1 + expert_slot*args.nb11) + ib * QK_K + 128 * iq + 8 * ir;
+        {
             float yl[32];
             float4 sumy = {0.f, 0.f, 0.f, 0.f};
             for (short i = 0; i < 8; ++i) {
@@ -5975,8 +5973,6 @@ kernel void kernel_mul_mv_id_q2_K_sum6_f32(
                 sc += args.nb01;
                 dh += args.nb01/2;
             }
-
-            y4 += 4 * QK_K;
         }
     }
 
