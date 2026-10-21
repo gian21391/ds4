@@ -284,3 +284,62 @@ kernel void kernel_dsv41_indexer_scores_packed(
     }
 }
 #endif
+
+// V4.1 decode router for one token over 384 experts: sqrt(softplus(logit)),
+// the biased top-6 and the normalized expert weights in one dispatch of 512
+// threads. Each step repeats the unary, bin, argsort, get_rows and sum_rows
+// kernels of the generic path, so the selection and weights stay identical.
+kernel void kernel_dsv41_router_select_one(
+        constant float &scale,
+        device const float *logits,
+        device float *probs,
+        device const float *bias,
+        device int32_t *selected,
+        device float *weights,
+        threadgroup int32_t *idx [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr int n = 384;
+    threadgroup float *score = (threadgroup float *)(idx + 512);
+    threadgroup float *prob = score + 512;
+    if (tid < n / 4) {
+        const float4 x = ((device const float4 *)logits)[tid];
+        const float4 ex = exp(x);
+        const float4 em = min(ex, 0.03125f);
+        const float4 poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
+        const float4 p = sqrt(select(select(log(1 + ex), poly, ex < 0.03125f), x, x > 20));
+        ((device float4 *)probs)[tid] = p;
+        ((threadgroup float4 *)prob)[tid] = p;
+        ((threadgroup float4 *)score)[tid] = p + ((device const float4 *)bias)[tid];
+    }
+    idx[tid] = (int32_t)tid;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint k = 2; k <= 512; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            const uint other = tid ^ j;
+            if (other > tid) {
+                const int a = idx[tid], b = idx[other];
+                const bool swap = (tid & k) == 0 ?
+                    a >= n || (b < n && score[a] < score[b]) :
+                    b >= n || (a < n && score[a] > score[b]);
+                if (swap) {
+                    idx[tid] = b;
+                    idx[other] = a;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    if (sgitg == 0) {
+        const float w = tiisg < 6 ? prob[idx[tiisg]] : 0.0f;
+        const float sum = max(simd_sum(w), 6.103515625e-5f);
+        if (tiisg < 6) {
+            selected[tiisg] = idx[tiisg];
+            /* Round the quotient before scaling, as the separate div and
+             * scale kernels do. */
+            weights[tiisg] = w / sum;
+            weights[tiisg] = ((device volatile float *)weights)[tiisg] * scale;
+        }
+    }
+}
