@@ -79,10 +79,25 @@ int ds4_gpu_dsv41_shared_mask(ds4_gpu_tensor *shared, const ds4_gpu_tensor *sele
  * the heads in BF16 and applies the inverse RoPE; the Q8 low projection
  * stores BF16. */
 void ds4_gpu_dsv41_rope_next_heads(uint32_t width, uint32_t start, bool compressed);
+/* Decode attention over the raw window ring and the selected compressed rows,
+ * gathered in place; the reduce rounds and rotates the heads as above. */
+int ds4_gpu_dsv41_attention_decode(ds4_gpu_tensor *heads, const void *model_map,
+                                  uint64_t model_size, uint64_t sinks_offset,
+                                  const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw,
+                                  uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+                                  const ds4_gpu_tensor *comp, const ds4_gpu_tensor *ids,
+                                  uint32_t comp_rows, uint32_t n_comp, uint32_t n_head,
+                                  uint32_t pos, bool compressed);
 int ds4_gpu_dsv41_attention_output_low(
         ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
         uint32_t n_groups, const ds4_gpu_tensor *heads);
+/* Single device: the Q8 wo_b projection of the low rows into block, with the
+ * BF16 HC expand of the block (rounded on load) into out. */
+int ds4_gpu_dsv41_attention_output_expand(ds4_gpu_tensor *out, ds4_gpu_tensor *block,
+        const void *model_map, uint64_t model_size, uint64_t out_b_offset,
+        uint32_t in_dim, const ds4_gpu_tensor *low, const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *split, uint32_t width);
 #endif
 /* Full-head prefill, with BF16 rounding between the two Q8 projections. */
 int ds4_gpu_dsv41_attention_output_batch(

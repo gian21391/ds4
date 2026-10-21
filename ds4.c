@@ -41478,6 +41478,17 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
         ds41_matmul(g->block, m, l->attn_output_b, g->low, false);
 }
 
+/* On one Metal device the decode wo_b matvec also applies the attention HC
+ * expand, so ds41_graph_after_attention starts from after_attn. */
+static bool ds41_attention_expands(const ds41_gpu_graph *g, const ds4_layer_weights *l) {
+#ifdef __APPLE__
+    return g->tp_world < 2 && l->attn_output_b->type == DS4_TENSOR_Q8_0;
+#else
+    (void)g; (void)l;
+    return false;
+#endif
+}
+
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                                    const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -41643,21 +41654,32 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
 #endif
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
+    const uint64_t sinks = l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float);
+    const uint32_t raw_start = (pos + 1u - n_raw) % 128u;
     bool ok = ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) &&
         ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
-                            g->kv, 0, 512u * 4u) &&
-        (!n_comp || ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
-                                            g->selected_comp, n_comp, attended));
+                            g->kv, 0, 512u * 4u);
 #ifdef __APPLE__
     ds4_gpu_concurrent_barrier();
-    /* The attention reduce rounds the heads and applies the inverse RoPE. */
-    ds4_gpu_dsv41_rope_next_heads(DS4_N_HEAD_DIM, pos, ratio != 0);
-#endif
-    ok = ok && ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
-            l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
-            g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
-            g->selected_kv, 0, attended, NULL, 0,
+    /* The attention reduce rounds the heads and applies the inverse RoPE. With
+     * compressed rows the attention reads them through the selection itself. */
+    if (n_comp) {
+        ok = ok && ds4_gpu_dsv41_attention_decode(g->heads, m->map, m->size, sinks,
+                g->q, g->window[il], n_raw, 128, raw_start, g->compressed[owner],
+                g->selected_comp, n_comp, attended, heads, pos, ratio != 0);
+    } else {
+        ds4_gpu_dsv41_rope_next_heads(DS4_N_HEAD_DIM, pos, ratio != 0);
+        ok = ok && ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size, sinks,
+                g->q, g->window[il], n_raw, 128, raw_start, g->selected_kv, 0, 0, NULL, 0,
+                heads, DS4_N_HEAD_DIM);
+    }
+#else
+    ok = ok && (!n_comp || ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+                                                  g->selected_comp, n_comp, attended)) &&
+        ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size, sinks,
+            g->q, g->window[il], n_raw, 128, raw_start, g->selected_kv, 0, attended, NULL, 0,
             heads, DS4_N_HEAD_DIM);
+#endif
 #ifdef __APPLE__
     if (levels) ds4_gpu_concurrent_end();
     if (!ok) return false;
@@ -41666,6 +41688,13 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
 #endif
     if (projected) return true;
+#ifdef __APPLE__
+    if (ds41_attention_expands(g, l))
+        return ds41_attention_low(g, m, l) &&
+            ds4_gpu_dsv41_attention_output_expand(g->after_attn, g->block, m->map, m->size,
+                l->attn_output_b->abs_offset, (uint32_t)l->attn_output_b->dim[0], g->low,
+                g->residual, g->attn_split, DS4_N_EMBD);
+#endif
     if (!ds41_attention_output(g, m, l) ||
         !ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN)) return false;
 #ifdef __APPLE__
@@ -41849,14 +41878,16 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
         ds41_hc_sum_norm(g, g->residual, g->pre, false, m, l->attn_norm);
 }
 
-/* Without split, ds41_moe_partial runs the FFN HC split (Metal). */
+/* Without split, ds41_moe_partial runs the FFN HC split (Metal). Expanded:
+ * the attention output already wrote after_attn. */
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
-                                      const ds4_layer_weights *l, bool split) {
+                                      const ds4_layer_weights *l, bool split, bool expanded) {
 #ifdef __APPLE__
     /* The FFN HC mix feeds only the post-FFN expand: run it beside the FFN
      * input sum and norm, as in ds41_attention_project, with its norm and
      * projection (stages 0 and 1) in one kernel. */
-    if (!ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split)) return false;
+    if (!expanded && !ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split))
+        return false;
     const bool levels = ds4_gpu_concurrent_begin() != 0;
     bool ok = ds4_gpu_hc_rms_norm_mix_f16_tensor(g->mix, g->after_attn, m->map, m->size,
             l->hc_ffn_fn->abs_offset, DS4_N_HC * DS4_N_EMBD, (uint32_t)l->hc_ffn_fn->dim[1],
@@ -41869,7 +41900,7 @@ static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
     if (levels) ds4_gpu_concurrent_end();
     return ok;
 #else
-    (void)split;
+    (void)split; (void)expanded;
     return ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split) &&
         ds41_hc_mix(g, m, l, true) &&
         ds41_hc_sum_norm(g, g->after_attn, g->attn_split, true, m, l->ffn_norm);
@@ -41879,7 +41910,7 @@ static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_layer_weights *l, uint32_t il) {
     return ds41_graph_before_attention(g, m, l, il) && ds41_attention(g, m, l, il, false) &&
-        ds41_graph_after_attention(g, m, l, true);
+        ds41_graph_after_attention(g, m, l, true, ds41_attention_expands(g, l));
 }
 
 static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
@@ -42174,8 +42205,8 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
     return ds41_graph_before_attention(g, m, l, il) && ds41_attention(g, m, l, il, false) &&
-        ds41_graph_after_attention(g, m, l, false) && ds41_moe(g, m, l, il, (uint32_t)token) &&
-        ds41_graph_after_moe(g);
+        ds41_graph_after_attention(g, m, l, false, ds41_attention_expands(g, l)) &&
+        ds41_moe(g, m, l, il, (uint32_t)token) && ds41_graph_after_moe(g);
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -42195,7 +42226,7 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
         const bool ok = island == 0 ?
             ds41_graph_before_attention(g, m, l, il) && ds41_attention_project(g, m, l) :
             island == 2 ? ds41_attention_output(g, m, l) :
-            ds41_graph_after_attention(g, m, l, true) && ds41_moe_partial(g, m, l, il, 0);
+            ds41_graph_after_attention(g, m, l, true, false) && ds41_moe_partial(g, m, l, il, 0);
         if (state != 0) return ok;
         if (!ok) ds4_gpu_decode_graph_abort(&key);
         else if (ds4_gpu_decode_graph_end(&key) == 0) return true;
@@ -42964,7 +42995,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #define DS41_USE_FFN_ROW(name, width) row.name = g->rows_view[t].name;
                     DS41_PREFILL_ROWS(DS41_USE_FFN_ROW)
 #undef DS41_USE_FFN_ROW
-                    ok = ds41_graph_after_attention(&row, m, l, batch_moe);
+                    ok = ds41_graph_after_attention(&row, m, l, batch_moe, false);
                     if (ok && !batch_moe) ok = ds41_moe(&row, m, l, il, (uint32_t)tokens[off + t]) &&
                         ds41_graph_after_moe(&row);
                 }

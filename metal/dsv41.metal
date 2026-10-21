@@ -82,6 +82,146 @@ kernel void kernel_dsv41_flash_attn_reduce_rope(
     x[i + 1u] = dsv41_bf16(re * s + im * c);
 }
 
+struct ds4_metal_args_dsv41_flash_attn {
+    uint n_raw;
+    uint raw_cap;
+    uint raw_start;
+    uint n_comp;
+    uint n_head;
+    float scale;
+};
+
+// Decode FlashAttention over the raw window ring and the selected compressed
+// rows, gathered in place: the arithmetic of kernel_flash_attn_ext_vec_f16_dk512_dv512
+// (one simdgroup per head and split, 32 splits of 32-key chunks, zero mask)
+// without its F16 staging copies. Eight heads share each chunk staged in
+// threadgroup memory; the partials feed kernel_dsv41_flash_attn_reduce_rope.
+kernel void kernel_dsv41_flash_attn_decode(
+        constant ds4_metal_args_dsv41_flash_attn &args,
+        device const float *q,
+        device const float *raw,
+        device const float *comp,
+        device const int *ids,
+        device const float *sinks,
+        device float *dst,
+        threadgroup half4 *kv4 [[threadgroup(0)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    constexpr short C = 32, NWG = 32, DV4 = 128;
+    const uint head = tgpig.x * nsg + sgitg;
+    const short iwg = tgpig.y;
+    const uint n_keys = args.n_raw + args.n_comp;
+
+    device const float4 *q4 = (device const float4 *)(q + (ulong)head * 512u);
+    half4 sq4[4];
+    float4 so4[4];
+    FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
+        sq4[ii] = (half4)q4[ii * 32 + tiisg];
+        so4[ii] = 0.0f;
+    }
+
+    float S = 0.0f;
+    float M = -FLT_MAX/2;
+
+    for (uint ic = iwg * C; ic < n_keys; ic += NWG * C) {
+        /* Stage the chunk's 32 rows in F16, as the F16 KV copy did. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            /* Eight threads per row, all loads in flight at once. */
+            const uint r = tiitg / 8u, part = tiitg % 8u, key = ic + r;
+            device const float4 *src = nullptr;
+            if (key < args.n_raw) {
+                src = (device const float4 *)(raw + (ulong)((args.raw_start + key) % args.raw_cap) * 512u);
+            } else if (key < n_keys) {
+                src = (device const float4 *)(comp + (ulong)ids[key - args.n_raw] * 512u);
+            }
+            float4 x[DV4 / 8];
+            FOR_UNROLL (short k = 0; k < DV4 / 8; ++k) {
+                x[k] = src ? src[part + 8 * k] : 0.0f;
+            }
+            FOR_UNROLL (short k = 0; k < DV4 / 8; ++k) {
+                kv4[r * DV4 + part + 8 * k] = (half4)x[k];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const half sm = ic + tiisg < n_keys ? 0.0h : -MAXHALF;
+
+        /* Fully unrolled, the two key loops cost several times more. */
+        float s = 0.0f;
+#pragma clang loop unroll_count(4)
+        for (short cc = 0; cc < C; ++cc) {
+            float mqk = 0.0f;
+            FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
+                mqk += dot((float4)kv4[cc * DV4 + ii * 32 + tiisg], (float4)sq4[ii]);
+            }
+            mqk = simd_sum(mqk);
+            if (cc == tiisg) s = fma(mqk, args.scale, (float)sm);
+        }
+
+        {
+            const float m = M;
+
+            M = simd_max(max(M, s));
+
+            const float ms = exp(m - M);
+            const float vs = exp(s - M);
+
+            S = S*ms + simd_sum(vs);
+
+            s = vs;
+
+            FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
+                so4[ii] *= ms;
+            }
+        }
+
+        {
+            float4 lo[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma clang loop unroll_count(4)
+            for (short cc = 0; cc < C; ++cc) {
+                const float w = simd_shuffle(s, cc);
+                FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
+                    lo[ii] += float4(float4(kv4[cc * DV4 + ii * 32 + tiisg])*float4(w));
+                }
+            }
+            FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
+                so4[ii] += lo[ii];
+            }
+        }
+    }
+
+    if (iwg == 0) {
+        const float m = M;
+        const float s = tiisg == 0 ? sinks[head] : -FLT_MAX/2;
+
+        M = simd_max(max(M, s));
+
+        const float ms = exp(m - M);
+        const float vs = exp(s - M);
+
+        S = S*ms + simd_sum(vs);
+
+        FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
+            so4[ii] *= ms;
+        }
+    }
+
+    device float4 *dst4 = (device float4 *)dst;
+    device float *dst1 = dst + (ulong)args.n_head * 512u * NWG;
+    FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
+        dst4[((ulong)head * NWG + iwg) * DV4 + ii * 32 + tiisg] = so4[ii];
+    }
+    if (tiisg == 0) {
+        dst1[head * (2 * NWG) + 2 * iwg + 0] = S;
+        dst1[head * (2 * NWG) + 2 * iwg + 1] = M;
+    }
+}
+
+
 kernel void kernel_dsv41_quantize(
         constant ds4_metal_args_dsv41_quantize &args,
         device float *x,

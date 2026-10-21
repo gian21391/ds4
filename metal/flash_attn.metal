@@ -1352,7 +1352,7 @@ kernel void kernel_flash_attn_ext_vec(
         const float S = NWG == 1 ? (ss[0] == 0.0f ? 0.0f : 1.0f/ss[0]) : 1.0f;
 
         for (short i = tiisg; i < DV4; i += NW) {
-            dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[i]*S;
+            dst4[(rid*NWG + iwg)*DV4 + i] = (float4) so4[i]*S;
         }
 
         if (NWG > 1) {
@@ -1431,7 +1431,7 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
     for (short i = sgitg; i < DV4; i += NWG_) {
-        const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
+        const float4 v = simd_sum(htmp4[iwg*DV4 + i]*ms);
 
         if (iwg == 0) {
             dst4[i] = v*S;
