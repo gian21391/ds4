@@ -109,6 +109,54 @@ static inline float  ds4_hc_twice_sigmoid(float  z) { return 2.0f / (1.0f + exp(
 static inline float4 ds4_hc_twice_sigmoid(float4 z) { return 2.0f / (1.0f + exp(-z)); }
 #endif
 
+// The HC=4 split of one scaled and biased mixer row: sigmoid pre weights,
+// doubled sigmoid post gates and the Sinkhorn-normalized combination rows.
+static inline void ds4_hc_split_sinkhorn4(
+        float4 pre_z, float4 post_z, float4 r0, float4 r1, float4 r2, float4 r3,
+        int sinkhorn_iters, float epsv, device float * out) {
+    *((device float4 *) out) = ds4_hc_sigmoid(pre_z) + epsv;
+    *((device float4 *) (out + 4)) = ds4_hc_twice_sigmoid(post_z);
+
+    const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
+    const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
+    const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
+    const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
+
+    r0 = exp(r0 - m0);
+    r1 = exp(r1 - m1);
+    r2 = exp(r2 - m2);
+    r3 = exp(r3 - m3);
+
+    r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
+    r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
+    r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
+    r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
+
+    float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+    r0 *= col_inv;
+    r1 *= col_inv;
+    r2 *= col_inv;
+    r3 *= col_inv;
+
+    for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+        r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
+        r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
+        r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
+        r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
+
+        col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+        r0 *= col_inv;
+        r1 *= col_inv;
+        r2 *= col_inv;
+        r3 *= col_inv;
+    }
+
+    *((device float4 *) (out +  8)) = r0;
+    *((device float4 *) (out + 12)) = r1;
+    *((device float4 *) (out + 16)) = r2;
+    *((device float4 *) (out + 20)) = r3;
+}
+
 // Splits an HC mixer row into pre weights, post gates, and the HC-to-HC
 // combination matrix. The 4-channel path is specialized because DS4 Flash uses
 // HC=4 in normal inference, while the scalar fallback keeps diagnostics usable.
@@ -138,67 +186,15 @@ kernel void kernel_dsv4_hc_split_sinkhorn(
     const float comb_scale = scale[2];
 
     if (HC == 4) {
-        const float4 pre_z =
-            *((device const float4 *) mix) * pre_scale +
-            *((device const float4 *) base);
-        *((device float4 *) out) = ds4_hc_sigmoid(pre_z) + epsv;
-
-        const float4 post_z =
-            *((device const float4 *) (mix  + 4)) * post_scale +
-            *((device const float4 *) (base + 4));
-        *((device float4 *) (out + 4)) = ds4_hc_twice_sigmoid(post_z);
-
-        float4 r0 =
-            *((device const float4 *) (mix  +  8)) * comb_scale +
-            *((device const float4 *) (base +  8));
-        float4 r1 =
-            *((device const float4 *) (mix  + 12)) * comb_scale +
-            *((device const float4 *) (base + 12));
-        float4 r2 =
-            *((device const float4 *) (mix  + 16)) * comb_scale +
-            *((device const float4 *) (base + 16));
-        float4 r3 =
-            *((device const float4 *) (mix  + 20)) * comb_scale +
-            *((device const float4 *) (base + 20));
-
-        const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
-        const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
-        const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
-        const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
-
-        r0 = exp(r0 - m0);
-        r1 = exp(r1 - m1);
-        r2 = exp(r2 - m2);
-        r3 = exp(r3 - m3);
-
-        r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
-        r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
-        r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
-        r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
-
-        float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
-        r0 *= col_inv;
-        r1 *= col_inv;
-        r2 *= col_inv;
-        r3 *= col_inv;
-
-        for (int iter = 1; iter < args.sinkhorn_iters; ++iter) {
-            r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
-            r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
-            r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
-            r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
-
-            col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
-            r0 *= col_inv;
-            r1 *= col_inv;
-            r2 *= col_inv;
-            r3 *= col_inv;
-        }
-
-        *((device float4 *) (out +  8)) = r0;
-        *((device float4 *) (out + 12)) = r1;
-        *((device float4 *) (out + 16)) = r2;
-        *((device float4 *) (out + 20)) = r3;
+        device const float4 * mix4  = (device const float4 *) mix;
+        device const float4 * base4 = (device const float4 *) base;
+        ds4_hc_split_sinkhorn4(mix4[0] * pre_scale + base4[0],
+                               mix4[1] * post_scale + base4[1],
+                               mix4[2] * comb_scale + base4[2],
+                               mix4[3] * comb_scale + base4[3],
+                               mix4[4] * comb_scale + base4[4],
+                               mix4[5] * comb_scale + base4[5],
+                               args.sinkhorn_iters, epsv, out);
         return;
     }
 
@@ -281,6 +277,87 @@ kernel void kernel_dsv4_hc_split_sinkhorn(
     for (int i = 0; i < HC*HC; ++i) {
         out[2*HC + i] = c[i];
     }
+}
+
+struct ds4_metal_args_dsv41_hc_mix {
+    int32_t n;
+    int32_t n_splits;
+    int32_t sinkhorn_iters;
+    float   eps;
+    float   hc_eps;
+};
+
+// V4.1 decode HC mix in DeepSeek's order: (x/rms(x)).fn == (x.fn)/rms(x), so
+// each threadgroup forms the 24 dot products and the sum of squares over one
+// n/n_splits column chunk of the flattened HC row, eight simdgroups of three
+// rows; kernel_dsv41_hc_mix_split reduces the chunks.
+kernel void kernel_dsv41_hc_mix_partial_f16(
+        constant ds4_metal_args_dsv41_hc_mix & args,
+        device const float4 * x,
+        device const half4  * w,
+        device       float  * part,
+        uint   tg   [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    constexpr short R = 3;
+    const uint n4 = (uint)args.n/4;
+    const uint c4 = n4/(uint)args.n_splits;
+    const uint c0 = tg*c4;
+
+    float acc[R] = { 0.0f };
+    float sq = 0.0f;
+    for (uint i = lane; i < c4; i += N_SIMDWIDTH) {
+        const float4 xv = x[c0 + i];
+        sq += dot(xv, xv);
+        FOR_UNROLL (short r = 0; r < R; ++r) {
+            acc[r] += dot(float4(w[(uint)(sg*R + r)*n4 + c0 + i]), xv);
+        }
+    }
+    FOR_UNROLL (short r = 0; r < R; ++r) {
+        acc[r] = simd_sum(acc[r]);
+        if (lane == 0) part[tg*25 + sg*R + r] = acc[r];
+    }
+    if (sg == 0) {
+        sq = simd_sum(sq);
+        if (lane == 0) part[tg*25 + 24] = sq;
+    }
+}
+
+// One simdgroup: sums the chunks, scales the projection by the RMS and splits
+// the HC=4 mixer row as kernel_dsv4_hc_split_sinkhorn.
+kernel void kernel_dsv41_hc_mix_split(
+        constant ds4_metal_args_dsv41_hc_mix & args,
+        device const float * part,
+        device const float * scale,
+        device const float * base,
+        device       float * dst,
+        ushort lane [[thread_index_in_simdgroup]]) {
+    float v[25] = { 0.0f };
+    for (int k = lane; k < args.n_splits; k += N_SIMDWIDTH) {
+        FOR_UNROLL (short j = 0; j < 25; ++j) {
+            v[j] += part[k*25 + j];
+        }
+    }
+    FOR_UNROLL (short j = 0; j < 25; ++j) {
+        v[j] = simd_sum(v[j]);
+    }
+    if (lane != 0) {
+        return;
+    }
+
+    const float rs = 1.0f/sqrt(v[24]/(float)args.n + args.eps);
+    float4 mix[6];
+    FOR_UNROLL (short i = 0; i < 6; ++i) {
+        mix[i] = float4(v[4*i], v[4*i + 1], v[4*i + 2], v[4*i + 3])*rs;
+    }
+    device const float4 * base4 = (device const float4 *) base;
+    ds4_hc_split_sinkhorn4(mix[0] * scale[0] + base4[0],
+                           mix[1] * scale[1] + base4[1],
+                           mix[2] * scale[2] + base4[2],
+                           mix[3] * scale[2] + base4[3],
+                           mix[4] * scale[2] + base4[4],
+                           mix[5] * scale[2] + base4[5],
+                           args.sinkhorn_iters, args.hc_eps, dst);
 }
 
 // Decode-side fusion of HC split and pre-weighted HC reduction. One threadgroup

@@ -41417,12 +41417,22 @@ static bool ds41_rope(ds4_gpu_tensor *x, uint32_t heads, uint32_t width,
                               ds4_layer_compress_ratio(il) != 0, inverse);
 }
 
-/* One of the HC mix's three dependent kernels, so Metal can run them
- * beside other work. */
+/* One of the HC mix's dependent kernels, so Metal can run them beside other
+ * work. Metal has two: the split-K x.fn and sum(x^2) partials (in flat_norm),
+ * then their reduction, the RMS scale and the split. */
 static bool ds41_hc_mix_stage(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_layer_weights *l, bool ffn, int stage) {
     const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
     const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
+#ifdef __APPLE__
+    if (stage == 0)
+        return ds4_gpu_dsv41_hc_mix_partial(g->flat_norm, ffn ? g->after_attn : g->residual,
+            m->map, m->size, (ffn ? l->hc_ffn_fn : l->hc_attn_fn)->abs_offset,
+            DS4_N_HC * DS4_N_EMBD);
+    return ds4_gpu_dsv41_hc_mix_split(ffn ? g->ffn_split : g->attn_split, g->flat_norm,
+        m->map, m->size, scale->abs_offset, base->abs_offset, DS4_N_HC * DS4_N_EMBD,
+        DS4_N_HC_SINKHORN_ITER, DS4_RMS_EPS, DS4_HC_EPS);
+#else
     if (stage == 0)
         return ds4_gpu_rms_norm_plain_tensor(g->flat_norm, ffn ? g->after_attn : g->residual,
                                              DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS);
@@ -41430,13 +41440,16 @@ static bool ds41_hc_mix_stage(ds41_gpu_graph *g, const ds4_model *m,
     return ds4_gpu_hc_split_sinkhorn_tensor(ffn ? g->ffn_split : g->attn_split,
                g->mix, m->map, m->size, scale->abs_offset, base->abs_offset,
                DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
+#endif
 }
 
-static DS4_MAYBE_UNUSED bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
-                                         const ds4_layer_weights *l, bool ffn) {
+#ifndef __APPLE__
+static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
+                        const ds4_layer_weights *l, bool ffn) {
     return ds41_hc_mix_stage(g, m, l, ffn, 0) && ds41_hc_mix_stage(g, m, l, ffn, 1) &&
            ds41_hc_mix_stage(g, m, l, ffn, 2);
 }
+#endif
 
 /* The HC sum and the norm of the sum; one kernel on Metal. */
 static bool ds41_hc_sum_norm(ds41_gpu_graph *g, const ds4_gpu_tensor *in,
@@ -41609,7 +41622,6 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
     ds4_gpu_concurrent_barrier();
     ok = ok && ds41_matmul(g->q, m, &q_b, g->qr, false) &&
         ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, g->pos, false) &&
-        ds41_hc_mix_stage(g, m, l, false, 2) &&
         (!index || ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, false));
     ds4_gpu_concurrent_barrier();
     ok = ok && ds41_bf16(g->q, q_dim) &&
@@ -41639,9 +41651,8 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
 #ifdef __APPLE__
-    /* The KV publish and index scoring run first, so the q RoPE, the window
-     * store and the sparse KV gather form one concurrent level, and the
-     * attention's KV staging copies the next. */
+    /* The KV publish and index scoring run first; the attention and its
+     * reduce form one concurrent section. */
     if (!ds41_attention_project(g, m, l, il) || !ds41_attention_publish(g, m, l, il) ||
         !ds41_attention_score(g, il)) return false;
     const bool levels = ds4_gpu_concurrent_begin() != 0;
@@ -41655,30 +41666,22 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
     const uint64_t sinks = l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float);
-    const uint32_t raw_start = (pos + 1u - n_raw) % 128u;
-    bool ok = ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) &&
-        ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
-                            g->kv, 0, 512u * 4u);
 #ifdef __APPLE__
-    ds4_gpu_concurrent_barrier();
-    /* The attention reduce rounds the heads and applies the inverse RoPE. With
-     * compressed rows the attention reads them through the selection itself. */
-    if (n_comp) {
-        ok = ok && ds4_gpu_dsv41_attention_decode(g->heads, m->map, m->size, sinks,
-                g->q, g->window[il], n_raw, 128, raw_start, g->compressed[owner],
-                g->selected_comp, n_comp, attended, heads, pos, ratio != 0);
-    } else {
-        ds4_gpu_dsv41_rope_next_heads(DS4_N_HEAD_DIM, pos, ratio != 0);
-        ok = ok && ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size, sinks,
-                g->q, g->window[il], n_raw, 128, raw_start, g->selected_kv, 0, 0, NULL, 0,
-                heads, DS4_N_HEAD_DIM);
-    }
+    /* The attention ropes q, stores the window row and reads the selected
+     * compressed rows itself; its reduce rounds the heads and applies the
+     * inverse RoPE. */
+    const bool ok = ds4_gpu_dsv41_attention_decode(g->heads, m->map, m->size, sinks,
+            g->q, g->kv, g->window[il], n_raw, 128, g->compressed[owner],
+            g->selected_comp, n_comp, attended, heads, pos, ratio != 0);
 #else
-    ok = ok && (!n_comp || ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
-                                                  g->selected_comp, n_comp, attended)) &&
+    const bool ok = ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) &&
+        ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
+                            g->kv, 0, 512u * 4u) &&
+        (!n_comp || ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+                                            g->selected_comp, n_comp, attended)) &&
         ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size, sinks,
-            g->q, g->window[il], n_raw, 128, raw_start, g->selected_kv, 0, attended, NULL, 0,
-            heads, DS4_N_HEAD_DIM);
+            g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u, g->selected_kv, 0,
+            attended, NULL, 0, heads, DS4_N_HEAD_DIM);
 #endif
 #ifdef __APPLE__
     if (levels) ds4_gpu_concurrent_end();
@@ -41786,7 +41789,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     }
     /* The FFN HC split feeds only the post-FFN expand: run it beside the
      * experts (ds41_graph_after_attention). */
-    if (!ds41_hc_mix_stage(g, m, l, true, 2)) return false;
+    if (!ds41_hc_mix_stage(g, m, l, true, 1)) return false;
 #endif
     if (shared_here && !shared_queued &&
         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
@@ -41883,19 +41886,16 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l, bool split, bool expanded) {
 #ifdef __APPLE__
-    /* The FFN HC mix feeds only the post-FFN expand: run it beside the FFN
-     * input sum and norm, as in ds41_attention_project, with its norm and
-     * projection (stages 0 and 1) in one kernel. */
+    /* The FFN HC mix feeds only the post-FFN expand: run its partials beside
+     * the FFN input sum and norm, as in ds41_attention_project. */
     if (!expanded && !ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split))
         return false;
     const bool levels = ds4_gpu_concurrent_begin() != 0;
-    bool ok = ds4_gpu_hc_rms_norm_mix_f16_tensor(g->mix, g->after_attn, m->map, m->size,
-            l->hc_ffn_fn->abs_offset, DS4_N_HC * DS4_N_EMBD, (uint32_t)l->hc_ffn_fn->dim[1],
-            DS4_RMS_EPS) &&
+    bool ok = ds41_hc_mix_stage(g, m, l, true, 0) &&
         ds41_hc_sum_norm(g, g->after_attn, g->attn_split, true, m, l->ffn_norm);
     if (split) {
         ds4_gpu_concurrent_barrier();
-        ok = ok && ds41_hc_mix_stage(g, m, l, true, 2);
+        ok = ok && ds41_hc_mix_stage(g, m, l, true, 1);
     }
     if (levels) ds4_gpu_concurrent_end();
     return ok;
@@ -42202,11 +42202,22 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
     return ok && ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
+/* With next_norm (Metal, one device), the post-FFN expand also forms the
+ * next layer's HC sum and norm, so that layer starts normed. */
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
-                            const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_attention(g, m, l, il) && ds41_attention(g, m, l, il, false) &&
-        ds41_graph_after_attention(g, m, l, false, ds41_attention_expands(g, l)) &&
-        ds41_moe(g, m, l, il, (uint32_t)token) && ds41_graph_after_moe(g);
+                            const ds4_layer_weights *l, uint32_t il, int token,
+                            bool normed, const ds4_tensor *next_norm) {
+    if ((!normed && !ds41_graph_before_attention(g, m, l, il)) ||
+        !ds41_attention(g, m, l, il, false) ||
+        !ds41_graph_after_attention(g, m, l, false, ds41_attention_expands(g, l)) ||
+        !ds41_moe(g, m, l, il, (uint32_t)token)) return false;
+#ifdef __APPLE__
+    if (next_norm)
+        return ds4_gpu_dsv41_hc_expand_sum_norm(g->residual, g->pre, g->norm, g->x,
+            g->routed, g->shared, g->after_attn, g->ffn_split, m->map, m->size,
+            next_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS);
+#endif
+    return ds41_graph_after_moe(g);
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -42241,7 +42252,7 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
         g_expert_profile.active || getenv("DS4_CUDA_MOE_PROFILE") ||
         metal_graph_debug_get_config()->prefix ||
         !ds4_gpu_decode_graphs_supported())
-        return ds41_graph_layer(g, m, l, il, token);
+        return ds41_graph_layer(g, m, l, il, token, false, NULL);
     return ds41_decode_island(g, m, l, il, 0) &&
         ds41_attention(g, m, l, il, true) && ds41_decode_island(g, m, l, il, 2) &&
         ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
@@ -42358,8 +42369,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     const bool queue_layers = !g->imatrix && (g->tp_world == 2 ?
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE") : !layer_resident);
     const bool queue_logits = logits && queue_layers && g->tp_world == 1;
+    bool normed = false;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+#ifdef __APPLE__
+        /* The next layer starts with its HC sum and norm, unless it first
+         * adds Engram rows or captures the residual. */
+        const ds4_tensor *next_norm = il + 1u < DS4_N_LAYER && g->tp_world < 2 &&
+            !g->streaming && !g->imatrix && !g->dspark && !ds41_engram_layer(il + 1u) ?
+            w->layer[il + 1u].attn_norm : NULL;
+#else
+        const ds4_tensor *next_norm = NULL;
+#endif
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         if (ok && ds41_engram_layer(il)) {
@@ -42371,7 +42392,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
             ok = ds41_graph_decode_layer(g, m, l, il, token);
 #else
-            ok = ds41_graph_layer(g, m, l, il, token);
+            ok = ds41_graph_layer(g, m, l, il, token, normed, next_norm);
+            normed = next_norm != NULL;
 #endif
         }
         /* TP gates already submit ordered, bounded command buffers; a single
@@ -42952,7 +42974,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #undef DS41_USE_ROW
                 ok = batch_attention ? ds41_graph_before_attention(&row, m, &w->layer[il], il) :
                     batch_moe ? ds41_graph_before_moe(&row, m, &w->layer[il], il) :
-                    ds41_graph_layer(&row, m, &w->layer[il], il, tokens[off + t]);
+                    ds41_graph_layer(&row, m, &w->layer[il], il, tokens[off + t], false, NULL);
             }
             if (ok && batch_attention) {
                 const ds4_layer_weights *l = &w->layer[il];

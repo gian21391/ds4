@@ -37,19 +37,26 @@ struct ds4_metal_args_dsv41_rope {
     float frequencies[32];
 };
 
+/* Shared and noinline so the attention's fused q RoPE compiles to the same
+ * arithmetic as this kernel's. */
+static __attribute__((noinline)) float2 dsv41_rope_pair(float re, float im, float theta,
+                                                        uint inverse) {
+    const float c = precise::cos(theta);
+    const float s = inverse ? -precise::sin(theta) : precise::sin(theta);
+    return float2(dsv41_bf16(re * c - im * s), dsv41_bf16(re * s + im * c));
+}
+
 kernel void kernel_dsv41_rope(
         constant ds4_metal_args_dsv41_rope &args,
         device float *x,
         uint2 group [[threadgroup_position_in_grid]],
         uint lane [[thread_index_in_simdgroup]]) {
     const float theta = float(args.start + group.y * args.stride) * args.frequencies[lane];
-    const float c = precise::cos(theta);
-    const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
     const ulong i = ((ulong)group.y * args.heads + group.x) * args.width +
                     args.width - 64u + 2u * lane;
-    const float re = x[i], im = x[i + 1u];
-    x[i] = dsv41_bf16(re * c - im * s);
-    x[i + 1u] = dsv41_bf16(re * s + im * c);
+    const float2 y = dsv41_rope_pair(x[i], x[i + 1u], theta, args.inverse);
+    x[i] = y.x;
+    x[i + 1u] = y.y;
 }
 
 // Decode attention reduce followed by the BF16 store and the RoPE of the one
@@ -60,13 +67,14 @@ kernel void kernel_dsv41_flash_attn_reduce_rope(
         device  const char * htmp,
         device        char * dst,
         constant ds4_metal_args_dsv41_rope & rope,
+        constant uint & splits,
         uint   tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     ds4_flash_attn_vec_reduce_row(args, htmp, dst, tgpig, tiisg, sgitg,
                                   (short)FC_flash_attn_ext_vec_reduce_NWG,
-                                  (short)FC_flash_attn_ext_vec_reduce_DV);
+                                  (short)FC_flash_attn_ext_vec_reduce_DV, (short)splits);
     threadgroup_barrier(mem_flags::mem_device);
     device float *x = (device float *)dst + (ulong)tgpig * rope.width;
     const uint tail = rope.width - 64u;
@@ -96,14 +104,19 @@ struct ds4_metal_args_dsv41_flash_attn {
 // (one simdgroup per head and split, 32 splits of 32-key chunks, zero mask)
 // without its F16 staging copies. Eight heads share each chunk staged in
 // threadgroup memory; the partials feed kernel_dsv41_flash_attn_reduce_rope.
+// Only the splits that hold keys run.
+// It also applies kernel_dsv41_rope to q as it loads it, and stores the new
+// KV row in its window slot while reading that row from kv.
 kernel void kernel_dsv41_flash_attn_decode(
         constant ds4_metal_args_dsv41_flash_attn &args,
         device const float *q,
-        device const float *raw,
+        device const float *kv,
+        device float *raw,
         device const float *comp,
         device const int *ids,
         device const float *sinks,
         device float *dst,
+        constant ds4_metal_args_dsv41_rope &rope,
         threadgroup half4 *kv4 [[threadgroup(0)]],
         uint2 tgpig [[threadgroup_position_in_grid]],
         ushort tiitg [[thread_index_in_threadgroup]],
@@ -115,11 +128,24 @@ kernel void kernel_dsv41_flash_attn_decode(
     const short iwg = tgpig.y;
     const uint n_keys = args.n_raw + args.n_comp;
 
+    const uint last = (args.raw_start + args.n_raw - 1u) % args.raw_cap;
+    if (tgpig.x == 0 && tgpig.y == 0 && tiitg < DV4)
+        ((device float4 *)raw)[last * DV4 + tiitg] = ((device const float4 *)kv)[tiitg];
+
     device const float4 *q4 = (device const float4 *)(q + (ulong)head * 512u);
     half4 sq4[4];
     float4 so4[4];
     FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
-        sq4[ii] = (half4)q4[ii * 32 + tiisg];
+        float4 x = q4[ii * 32 + tiisg];
+        if (ii == 3 && tiisg >= 16) {
+            FOR_UNROLL (short p = 0; p < 2; ++p) {
+                const float theta = float(rope.start) * rope.frequencies[2 * (tiisg - 16) + p];
+                const float2 y = dsv41_rope_pair(x[2 * p], x[2 * p + 1], theta, rope.inverse);
+                x[2 * p] = y.x;
+                x[2 * p + 1] = y.y;
+            }
+        }
+        sq4[ii] = (half4)x;
         so4[ii] = 0.0f;
     }
 
@@ -133,7 +159,9 @@ kernel void kernel_dsv41_flash_attn_decode(
             /* Eight threads per row, all loads in flight at once. */
             const uint r = tiitg / 8u, part = tiitg % 8u, key = ic + r;
             device const float4 *src = nullptr;
-            if (key < args.n_raw) {
+            if (key + 1u == args.n_raw) {
+                src = (device const float4 *)kv;
+            } else if (key < args.n_raw) {
                 src = (device const float4 *)(raw + (ulong)((args.raw_start + key) % args.raw_cap) * 512u);
             } else if (key < n_keys) {
                 src = (device const float4 *)(comp + (ulong)ids[key - args.n_raw] * 512u);
@@ -253,6 +281,12 @@ struct ds4_metal_args_dsv41_engram {
     uint masked;
 };
 
+#define DSV41_ENGRAM_CHUNK 2560u
+
+/* One threadgroup per (row, HC): all threads stage a chunk of the inputs in
+ * threadgroup memory, and the first simdgroup sums them per lane in column
+ * order (as a lone simdgroup reading device memory would, but without
+ * waiting on each load). */
 kernel void kernel_dsv41_engram_add(
         constant ds4_metal_args_dsv41_engram &args,
         device float *residual,
@@ -260,27 +294,53 @@ kernel void kernel_dsv41_engram_add(
         device const float *q_weight,
         device const float *k_weight,
         device const uchar *mask,
+        threadgroup float *shared [[threadgroup(0)]],
         uint2 group [[threadgroup_position_in_grid]],
+        uint2 nt2 [[threads_per_threadgroup]],
+        uint tid [[thread_index_in_threadgroup]],
         uint lane [[thread_index_in_simdgroup]]) {
     if (args.masked && !mask[group.x]) return;
+    const uint nt = nt2.x;
     const ulong offset = ((ulong)group.x * 4u + group.y) * args.width;
     const ulong key_offset = ((ulong)group.x * 5u + group.y) * args.width;
     const ulong value_offset = ((ulong)group.x * 5u + 4u) * args.width;
+    device const float *q = q_weight + group.y * args.width;
+    device const float *kw = k_weight + group.y * args.width;
+    threadgroup float *sh = shared;
+    threadgroup float *sk = shared + DSV41_ENGRAM_CHUNK;
+    threadgroup float *sw = shared + 2u * DSV41_ENGRAM_CHUNK;
+    threadgroup float *sgate = shared + 3u * DSV41_ENGRAM_CHUNK;
     float h2 = 0.0f, k2 = 0.0f, dot = 0.0f;
-    for (uint i = lane; i < args.width; i += 32u) {
-        const float h = residual[offset + i];
-        const float k = dsv41_bf16(kv[key_offset + i]);
-        const uint wi = group.y * args.width + i;
-        h2 += h * h;
-        k2 += k * k;
-        dot += h * (q_weight[wi] * k_weight[wi]) * k;
+    for (uint c = 0; c < args.width; c += DSV41_ENGRAM_CHUNK) {
+        const uint n = min(DSV41_ENGRAM_CHUNK, args.width - c);
+        for (uint i = tid; i < n; i += nt) {
+            sh[i] = residual[offset + c + i];
+            sk[i] = dsv41_bf16(kv[key_offset + c + i]);
+            sw[i] = q[c + i] * kw[c + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 32u) {
+            for (uint i = lane; i < n; i += 32u) {
+                const float h = sh[i];
+                const float k = sk[i];
+                h2 += h * h;
+                k2 += k * k;
+                dot += h * sw[i] * k;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    h2 = simd_sum(h2);
-    k2 = simd_sum(k2);
-    dot = simd_sum(dot) * rsqrt(h2 / args.width + args.eps) *
-          rsqrt(k2 / args.width + args.eps) * rsqrt(float(args.width));
-    const float gate = 1.0f / (1.0f + exp(-copysign(sqrt(max(abs(dot), 1.0e-6f)), dot)));
-    for (uint i = lane; i < args.width; i += 32u)
+    if (tid < 32u) {
+        h2 = simd_sum(h2);
+        k2 = simd_sum(k2);
+        dot = simd_sum(dot) * rsqrt(h2 / args.width + args.eps) *
+              rsqrt(k2 / args.width + args.eps) * rsqrt(float(args.width));
+        if (tid == 0)
+            sgate[0] = 1.0f / (1.0f + exp(-copysign(sqrt(max(abs(dot), 1.0e-6f)), dot)));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float gate = sgate[0];
+    for (uint i = tid; i < args.width; i += nt)
         residual[offset + i] = dsv41_bf16(residual[offset + i] +
             gate * dsv41_bf16(kv[value_offset + i]));
 }
@@ -459,8 +519,12 @@ kernel void kernel_dsv41_indexer_scores_packed(
 // the biased top-6 and the normalized expert weights in one dispatch of 512
 // threads. Each step repeats the unary, bin, argsort, get_rows and sum_rows
 // kernels of the generic path, so the selection and weights stay identical.
-// Each thread carries one sort element; compare-exchanges within a SIMD group
-// use shuffles, the wider ones go through double-buffered threadgroup memory.
+// Each SIMD group keeps its 7 best scores by SIMD max rounds, and every SIMD
+// group merges those 84 candidates: if the top 7 strictly decrease, the
+// first 6 are what the descending sort puts first. Otherwise (ties or NaN)
+// the threads run the bitonic sort, one sort element each; compare-exchanges
+// within a SIMD group use shuffles, the wider ones go through double-buffered
+// threadgroup memory.
 kernel void kernel_dsv41_router_select_one(
         constant float &scale,
         device const float *logits,
@@ -473,10 +537,16 @@ kernel void kernel_dsv41_router_select_one(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr int n = 384;
+    constexpr int K = 7;
     threadgroup float *prob = scratch;
     threadgroup float *score_tg[2] = {scratch + 512, scratch + 1024};
     threadgroup int32_t *idx_tg[2] = {(threadgroup int32_t *)(scratch + 1536),
                                       (threadgroup int32_t *)(scratch + 2048)};
+    /* The candidates use the second sort buffers, free until the sort. */
+    threadgroup float *cand_score = score_tg[1];
+    threadgroup int32_t *cand_idx = idx_tg[1];
+    threadgroup int32_t *unordered = idx_tg[1] + 511;
+    if (tid == 0) *unordered = 0;
     if (tid < n / 4) {
         const float4 x = ((device const float4 *)logits)[tid];
         const float4 ex = exp(x);
@@ -489,32 +559,74 @@ kernel void kernel_dsv41_router_select_one(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float score = score_tg[0][tid];
-    int32_t idx = (int32_t)tid;
-    uint stage = 1;
-    for (uint k = 2; k <= 512; k <<= 1) {
-        for (uint j = k >> 1; j > 0; j >>= 1) {
-            float peer_score;
-            int32_t peer_idx;
-            if (j < 32) {
-                peer_score = simd_shuffle_xor(score, (ushort)j);
-                peer_idx = simd_shuffle_xor(idx, (ushort)j);
-            } else {
-                score_tg[stage & 1][tid] = score;
-                idx_tg[stage & 1][tid] = idx;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                peer_score = score_tg[stage & 1][tid ^ j];
-                peer_idx = idx_tg[stage & 1][tid ^ j];
-                stage++;
+    if (tid < n) {
+        if (simd_any(isnan(score))) *unordered = 1;
+        bool taken = false;
+        for (int r = 0; r < K; ++r) {
+            const float v = taken ? -INFINITY : score;
+            const float m = simd_max(v);
+            if (tiisg == simd_min(!taken && v == m ? tiisg : (ushort)32)) {
+                cand_score[sgitg*K + r] = m;
+                cand_idx[sgitg*K + r] = (int32_t)tid;
+                taken = true;
             }
-            const bool lower = (tid & j) == 0;
-            const int a = lower ? idx : peer_idx, b = lower ? peer_idx : idx;
-            const float sa = lower ? score : peer_score, sb = lower ? peer_score : score;
-            const bool swap = (tid & k) == 0 ?
-                a >= n || (b < n && sa < sb) :
-                b >= n || (a < n && sa > sb);
-            if (swap) {
-                score = peer_score;
-                idx = peer_idx;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float c[3];
+    int32_t ci[3];
+    bool taken[3];
+    for (int q = 0; q < 3; ++q) {
+        const int e = tiisg + 32*q;
+        taken[q] = e >= (n/32)*K;
+        c[q] = taken[q] ? -INFINITY : cand_score[e];
+        ci[q] = taken[q] ? 0 : cand_idx[e];
+    }
+    int32_t idx = 0;
+    bool ordered = *unordered == 0;
+    float prev = INFINITY;
+    for (int r = 0; r < K; ++r) {
+        int bq = -1;
+        for (int q = 0; q < 3; ++q)
+            if (!taken[q] && (bq < 0 || c[q] > c[bq])) bq = q;
+        const float best = bq < 0 ? -INFINITY : c[bq];
+        const float m = simd_max(best);
+        const ushort w = simd_min(bq >= 0 && best == m ? tiisg : (ushort)32);
+        const int32_t widx = simd_shuffle(bq < 0 ? 0 : ci[bq], w);
+        if (tiisg == w) taken[bq] = true;
+        if (tiisg == r) idx = widx;
+        ordered = ordered && m < prev;
+        prev = m;
+    }
+    if (!ordered) {
+        idx = (int32_t)tid;
+        uint stage = 1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 2; k <= 512; k <<= 1) {
+            for (uint j = k >> 1; j > 0; j >>= 1) {
+                float peer_score;
+                int32_t peer_idx;
+                if (j < 32) {
+                    peer_score = simd_shuffle_xor(score, (ushort)j);
+                    peer_idx = simd_shuffle_xor(idx, (ushort)j);
+                } else {
+                    score_tg[stage & 1][tid] = score;
+                    idx_tg[stage & 1][tid] = idx;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    peer_score = score_tg[stage & 1][tid ^ j];
+                    peer_idx = idx_tg[stage & 1][tid ^ j];
+                    stage++;
+                }
+                const bool lower = (tid & j) == 0;
+                const int a = lower ? idx : peer_idx, b = lower ? peer_idx : idx;
+                const float sa = lower ? score : peer_score, sb = lower ? peer_score : score;
+                const bool swap = (tid & k) == 0 ?
+                    a >= n || (b < n && sa < sb) :
+                    b >= n || (a < n && sa > sb);
+                if (swap) {
+                    score = peer_score;
+                    idx = peer_idx;
+                }
             }
         }
     }
