@@ -651,7 +651,8 @@ kernel void kernel_dsv4_hc_expand(
 // HC=4 specialization of the post/expand step. One thread computes all four
 // destination HC streams for one token/dimension, reusing the same block output
 // and residual HC values while preserving the per-stream accumulation order.
-// V4.1 sets bf16 to round the block on load and the output on store.
+// V4.1 sets bf16 to round the block (and the add, before adding it) on load
+// and the output on store.
 kernel void kernel_dsv4_hc_expand4(
         constant ds4_metal_args_dsv4_hc_expand & args,
         device  const char * block_out,
@@ -675,7 +676,8 @@ kernel void kernel_dsv4_hc_expand4(
 
     float block_v = *((device const float *) (block_out + d*args.nb_block0 + t*args.nb_block1));
     if (args.has_add) {
-        block_v += *((device const float *) (block_add + d*args.nb_add0 + t*args.nb_add1));
+        const float add_v = *((device const float *) (block_add + d*args.nb_add0 + t*args.nb_add1));
+        block_v += args.bf16 ? dsv41_bf16(add_v) : add_v;
     }
     if (args.bf16) {
         block_v = dsv41_bf16(block_v);
@@ -1130,8 +1132,9 @@ struct ds4_metal_args_hc_norm_mix {
 // slice, preserving every simd_sum tree), and the matvec keeps the original
 // per-row accumulation order with y = x*scale computed on the fly, which
 // rounds identically to the materialized normalized row.  The host wrapper
-// gates this to n == 16384 && out_dim == 24, where the virtual-thread count
-// is exactly 1024 and the mv tail loop is empty.
+// gates this to out_dim == 24 and n a multiple of 32 of at least 4096 (V4:
+// 16384, V4.1: 20480), where the norm runs 1024 threads and the mv tail
+// loop is empty.
 kernel void kernel_dsv4_hc_rms_norm_mix_f16(
         constant ds4_metal_args_hc_norm_mix & args,
         device const char  * x,

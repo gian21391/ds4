@@ -92,6 +92,64 @@ template [[host_name("kernel_rms_norm_f32_4")]]     kernel kernel_rms_norm_fuse_
 template [[host_name("kernel_rms_norm_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 template [[host_name("kernel_dsv41_rms_norm_mul_bf16_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2, true>;
 
+// V4.1 decode HC=4 weighted sum (BF16 store) followed by the BF16 weighted
+// RMSNorm, in one threadgroup with the norm's thread mapping: each thread
+// sums the rows it then reduces, so both match the separate kernels.
+kernel void kernel_dsv41_hc_sum_rms_norm_mul_bf16_f32_4(
+        constant ds4_metal_args_dsv4_hc_weighted_sum & sargs,
+        constant ds4_metal_args_norm & args,
+        device const char * hc,
+        device const char * hc_weights,
+        device       char * sum_dst,
+        device const char * norm_weight,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    device const float * w = (device const float *) hc_weights;
+    device float4 * x = (device float4 *) sum_dst;
+
+    float sumf = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        float4 acc = 0.0f;
+        for (int h = 0; h < 4; ++h) {
+            acc += *((device const float4 *) (hc + i00*sizeof(float4) + h*sargs.nb_x1)) * w[h];
+        }
+        const float4 v = dsv41_bf16(acc);
+        x[i00] = v;
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean  = sumf/args.ne00;
+    const float scale = 1.0f/sqrt(mean + args.eps);
+
+    device float4 * y = (device float4 *) dst;
+    device const float4 * f0 = (device const float4 *) norm_weight;
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        // As in kernel_rms_norm_fuse_impl: reload the rounded input.
+        y[i00] = x[i00];
+        y[i00] = dsv41_bf16((((device volatile float4 *) y)[i00]*scale)*f0[i00]);
+    }
+}
+
 kernel void kernel_add_rms_norm_mul_f32_4(
         constant ds4_metal_args_norm & args,
         device const char * src0,

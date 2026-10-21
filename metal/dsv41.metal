@@ -52,6 +52,36 @@ kernel void kernel_dsv41_rope(
     x[i + 1u] = dsv41_bf16(re * s + im * c);
 }
 
+// Decode attention reduce followed by the BF16 store and the RoPE of the one
+// head row each threadgroup owns: the same arithmetic as the plain reduce,
+// kernel_dsv41_bf16_linear and kernel_dsv41_rope in turn.
+kernel void kernel_dsv41_flash_attn_reduce_rope(
+        constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
+        device  const char * htmp,
+        device        char * dst,
+        constant ds4_metal_args_dsv41_rope & rope,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    ds4_flash_attn_vec_reduce_row(args, htmp, dst, tgpig, tiisg, sgitg,
+                                  (short)FC_flash_attn_ext_vec_reduce_NWG,
+                                  (short)FC_flash_attn_ext_vec_reduce_DV);
+    threadgroup_barrier(mem_flags::mem_device);
+    device float *x = (device float *)dst + (ulong)tgpig * rope.width;
+    const uint tail = rope.width - 64u;
+    for (uint i = tiitg; i < tail; i += 32u * FC_flash_attn_ext_vec_reduce_NWG)
+        x[i] = dsv41_bf16(x[i]);
+    if (sgitg != 0) return;
+    const float theta = float(rope.start) * rope.frequencies[tiisg];
+    const float c = precise::cos(theta);
+    const float s = rope.inverse ? -precise::sin(theta) : precise::sin(theta);
+    const uint i = tail + 2u * tiisg;
+    const float re = dsv41_bf16(x[i]), im = dsv41_bf16(x[i + 1u]);
+    x[i] = dsv41_bf16(re * c - im * s);
+    x[i + 1u] = dsv41_bf16(re * s + im * c);
+}
+
 kernel void kernel_dsv41_quantize(
         constant ds4_metal_args_dsv41_quantize &args,
         device float *x,

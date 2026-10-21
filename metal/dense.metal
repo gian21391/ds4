@@ -70,7 +70,21 @@ struct ds4_metal_args_mul_mv_ext {
     int16_t r3;
 };
 
-template<short NR0>
+static inline float dsv41_bf16(float x) {
+    uint bits = as_type<uint>(x);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return as_type<float>(bits & 0xffff0000u);
+}
+
+static inline float4 dsv41_bf16(float4 x) {
+    uint4 bits = as_type<uint4>(x);
+    bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u),
+                   (bits & 0x7f800000u) != 0x7f800000u);
+    return as_type<float4>(bits & 0xffff0000u);
+}
+
+template<short NR0, bool BF16 = false>
 static inline void helper_mv_reduce_and_write(
         device float * dst_f32,
         float sumf[NR0],
@@ -107,12 +121,12 @@ static inline void helper_mv_reduce_and_write(
         float tot = simd_sum(shmem_f32[row][tiisg]);
 
         if (tiisg == 0 && sgitg == 0) {
-            dst_f32[r0 + row] = tot;
+            dst_f32[r0 + row] = BF16 ? dsv41_bf16(tot) : tot;
         }
     }
 }
 
-template<short NR0, typename args_t>
+template<short NR0, typename args_t, bool BF16 = false>
 void kernel_mul_mv_q8_0_f32_impl(
         args_t args,
         device const char * src0,
@@ -179,7 +193,7 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0, BF16>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
@@ -461,20 +475,6 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
             }
         }
     }
-}
-
-static inline float dsv41_bf16(float x) {
-    uint bits = as_type<uint>(x);
-    if ((bits & 0x7f800000u) != 0x7f800000u)
-        bits += 0x7fffu + ((bits >> 16u) & 1u);
-    return as_type<float>(bits & 0xffff0000u);
-}
-
-static inline float4 dsv41_bf16(float4 x) {
-    uint4 bits = as_type<uint4>(x);
-    bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u),
-                   (bits & 0x7f800000u) != 0x7f800000u);
-    return as_type<float4>(bits & 0xffff0000u);
 }
 
 // Decode shared-expert gate/up projections followed by SwiGLU:

@@ -3778,44 +3778,45 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
     return pipeline;
 }
 
-/* Pipeline for the RoPE-fused decode reduce. Same function constants as the
- * plain reduce so the split-K geometry is identical. */
+/* Pipeline for a RoPE-fused decode reduce (V4 or V4.1 kernel). Same function
+ * constants as the plain reduce so the split-K geometry is identical. */
 static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_rope_pipeline(
+        const char *name,
         int32_t dv,
         int32_t nwg) {
+    static const char *memo_name;
     static int32_t memo_dv, memo_nwg;
     static id<MTLComputePipelineState> memo_pipeline;
-    if (memo_pipeline && memo_dv == dv && memo_nwg == nwg) {
+    if (memo_pipeline && memo_name == name && memo_dv == dv && memo_nwg == nwg) {
         return memo_pipeline;
     }
-    NSString *key = [NSString stringWithFormat:@"kernel_flash_attn_ext_vec_reduce_rope_dv=%d_nwg=%d",
-                     (int)dv, (int)nwg];
+    NSString *key = [NSString stringWithFormat:@"%s_dv=%d_nwg=%d", name, (int)dv, (int)nwg];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) {
-        memo_dv = dv; memo_nwg = nwg; memo_pipeline = cached;
+        memo_name = name; memo_dv = dv; memo_nwg = nwg; memo_pipeline = cached;
         return cached;
     }
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&dv  type:MTLDataTypeInt atIndex:500];
     [constants setConstantValue:&nwg type:MTLDataTypeInt atIndex:501];
     NSError *error = nil;
-    id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_flash_attn_ext_vec_reduce_rope"
+    id<MTLFunction> fn = [g_library newFunctionWithName:@(name)
                                          constantValues:constants
                                                   error:&error];
     if (!fn) {
-        fprintf(stderr, "ds4: Metal kernel_flash_attn_ext_vec_reduce_rope not found: %s\n",
+        fprintf(stderr, "ds4: Metal %s not found: %s\n", name,
                 [[error localizedDescription] UTF8String]);
         return nil;
     }
     error = nil;
     id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
     if (!pipeline) {
-        fprintf(stderr, "ds4: Metal kernel_flash_attn_ext_vec_reduce_rope pipeline failed: %s\n",
+        fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n", name,
                 [[error localizedDescription] UTF8String]);
         return nil;
     }
     [g_pipeline_cache setObject:pipeline forKey:key];
-    memo_dv = dv; memo_nwg = nwg; memo_pipeline = pipeline;
+    memo_name = name; memo_dv = dv; memo_nwg = nwg; memo_pipeline = pipeline;
     return pipeline;
 }
 
@@ -6098,6 +6099,17 @@ void ds4_gpu_set_decode_attn_rope_fuse(
     g_decode_attn_rope_fuse = 1;
     g_decode_attn_rope_fuse_used = 0;
 }
+
+/* Matches ds4_metal_args_dsv41_rope in dsv41.metal. */
+typedef struct {
+    uint32_t width, heads, rows, start, inverse, stride;
+    float frequencies[32];
+} ds4_gpu_dsv41_rope_args;
+
+/* Set by ds4_gpu_dsv41_rope_next_heads for the next decode attention, whose
+ * reduce then rounds and rotates the heads. Cleared by the encoder. */
+static ds4_gpu_dsv41_rope_args g_dsv41_heads_rope;
+static int g_dsv41_heads_rope_armed;
 
 int ds4_gpu_decode_attn_rope_fuse_used(void) {
     return g_decode_attn_rope_fuse_used;
@@ -22445,6 +22457,67 @@ int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
     return ds4_gpu_rms_norm_weight_rows(out, x, map, size, offset, width, rows, eps, true);
 }
 
+/* One decode row: the BF16 HC sum (4 pre weights) and its BF16 norm in one
+ * threadgroup, with the same arithmetic as the separate kernels. */
+int ds4_gpu_dsv41_hc_sum_norm(ds4_gpu_tensor *out, ds4_gpu_tensor *sum,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *weights,
+        const void *map, uint64_t size, uint64_t offset, uint32_t width, float eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint64_t row_bytes = (uint64_t)width * sizeof(float);
+    if (!out || !sum || !x || !weights || width == 0 || (width & 3u) != 0 ||
+        ds4_gpu_tensor_bytes(out) < row_bytes || ds4_gpu_tensor_bytes(sum) < row_bytes ||
+        ds4_gpu_tensor_bytes(x) < 4u * row_bytes ||
+        ds4_gpu_tensor_bytes(weights) < 4u * sizeof(float) ||
+        offset > size || row_bytes > size - offset) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> hwbuf = ds4_gpu_tensor_buffer(weights);
+        id<MTLBuffer> sumbuf = ds4_gpu_tensor_buffer(sum);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        uint64_t inner = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(map, size, offset, row_bytes, &inner);
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv41_hc_sum_rms_norm_mul_bf16_f32_4");
+        if (!xbuf || !hwbuf || !sumbuf || !outbuf || !wbuf || !pipeline) return 0;
+        const ds4_gpu_hc_weighted_sum_args sum_args = {
+            .n_embd = width,
+            .n_hc = 4,
+            .n_tokens = 1,
+            .nb_x0 = sizeof(float),
+            .nb_x1 = row_bytes,
+            .nb_x2 = 4u * row_bytes,
+            .nb_w0 = sizeof(float),
+            .nb_w1 = 4u * sizeof(float),
+            .nb0 = sizeof(float),
+            .nb1 = row_bytes,
+            .bf16 = true,
+        };
+        ds4_gpu_rms_norm_args args = ds4_gpu_make_rms_norm_args(width, 1, eps);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&sum_args length:sizeof(sum_args) atIndex:0];
+        [enc setBytes:&args length:sizeof(args) atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:hwbuf offset:ds4_gpu_tensor_offset(weights) atIndex:3];
+        [enc setBuffer:sumbuf offset:ds4_gpu_tensor_offset(sum) atIndex:4];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner atIndex:5];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:6];
+        [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_threads(width), 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "V4.1 HC sum norm")) return 0;
+    }
+
+    return 1;
+}
+
 int ds4_gpu_add_rms_norm_weight_tensor(
         ds4_gpu_tensor       *norm_out,
         ds4_gpu_tensor       *sum_out,
@@ -26960,7 +27033,7 @@ int ds4_gpu_attention_output_q8_tp_tensor(
     }
 }
 
-int ds4_gpu_attention_output_low_q8_tensor(
+static int ds4_gpu_attention_output_low_q8_impl(
         ds4_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
@@ -26968,7 +27041,8 @@ int ds4_gpu_attention_output_low_q8_tensor(
         uint64_t                group_dim,
         uint64_t                rank,
         uint32_t                n_groups,
-        const ds4_gpu_tensor *heads) {
+        const ds4_gpu_tensor *heads,
+        bool                    bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!low || !heads || !model_map || group_dim == 0 || rank == 0 ||
         n_groups == 0 || group_dim > UINT32_MAX || rank > UINT32_MAX) {
@@ -27038,7 +27112,8 @@ int ds4_gpu_attention_output_low_q8_tensor(
                 .nr0 = 2,
             };
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
+                ds4_gpu_get_mul_mv_pipeline(bf16 ?
+                    "kernel_dsv41_attn_out_low_q8_0_bf16" : "kernel_dsv4_attn_out_low_q8_0_f32", 4);
             ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                                                          pipeline,
                                                          &args,
@@ -27058,6 +27133,27 @@ int ds4_gpu_attention_output_low_q8_tensor(
         }
         return ok ? 1 : 0;
     }
+}
+
+int ds4_gpu_attention_output_low_q8_tensor(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        const ds4_gpu_tensor *heads) {
+    return ds4_gpu_attention_output_low_q8_impl(low, model_map, model_size, out_a_offset,
+                                                group_dim, rank, n_groups, heads, false);
+}
+
+int ds4_gpu_dsv41_attention_output_low(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups, const ds4_gpu_tensor *heads) {
+    return ds4_gpu_attention_output_low_q8_impl(low, model_map, model_size, out_a_offset,
+                                                group_dim, rank, n_groups, heads, true);
 }
 
 int ds4_gpu_attention_output_low_q4_K_slice_tensor(
@@ -28021,11 +28117,21 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
     ds4_gpu_flash_attn_reduce_args reduce_args = {
         .nrows = (int32_t)nrows,
     };
+    const int dsv41_rope = g_dsv41_heads_rope_armed;
+    g_dsv41_heads_rope_armed = 0;
+    id<MTLComputePipelineState> reduce_pso = dsv41_rope ?
+        ds4_gpu_get_flash_attn_reduce_rope_pipeline("kernel_dsv41_flash_attn_reduce_rope",
+                                                    (int32_t)head_dim, (int32_t)nwg) :
+        reduce_pipeline;
+    if (!reduce_pso) return 0;
     enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:reduce_pipeline];
+    [enc setComputePipelineState:reduce_pso];
     [enc setBytes:&reduce_args length:sizeof(reduce_args) atIndex:0];
     [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:1];
     [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:2];
+    if (dsv41_rope) {
+        [enc setBytes:&g_dsv41_heads_rope length:sizeof(g_dsv41_heads_rope) atIndex:3];
+    }
     [enc dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -29752,10 +29858,13 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     const int fuse_rope = g_decode_attn_rope_fuse;
     g_decode_attn_rope_fuse = 0;
     if (fuse_rope) g_decode_attn_rope_fuse_used = 1;
+    const int dsv41_rope = g_dsv41_heads_rope_armed;
+    g_dsv41_heads_rope_armed = 0;
     id<MTLComputePipelineState> reduce_pso = reduce_pipeline;
-    if (fuse_rope) {
-        reduce_pso = ds4_gpu_get_flash_attn_reduce_rope_pipeline((int32_t)head_dim,
-                                                                   (int32_t)nwg);
+    if (fuse_rope || dsv41_rope) {
+        reduce_pso = ds4_gpu_get_flash_attn_reduce_rope_pipeline(dsv41_rope ?
+            "kernel_dsv41_flash_attn_reduce_rope" : "kernel_flash_attn_ext_vec_reduce_rope",
+            (int32_t)head_dim, (int32_t)nwg);
         if (!reduce_pso) return 0;
     }
     enc = ds4_gpu_compute_encoder(cb);
@@ -29766,6 +29875,8 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     if (fuse_rope) {
         [enc setBytes:&g_decode_attn_rope_args
                length:sizeof(g_decode_attn_rope_args) atIndex:3];
+    } else if (dsv41_rope) {
+        [enc setBytes:&g_dsv41_heads_rope length:sizeof(g_dsv41_heads_rope) atIndex:3];
     }
     [enc dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
@@ -45125,7 +45236,7 @@ int ds4_gpu_hc_rms_norm_mix_f16_tensor(
         uint32_t              out_dim,
         float                 eps) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!out || !x || !model_map || n != 16384u || out_dim != 24u) return 0;
+    if (!out || !x || !model_map || n < 4096u || (n & 31u) != 0 || out_dim != 24u) return 0;
 
     @autoreleasepool {
         const uint64_t row_bytes = (uint64_t)n * sizeof(uint16_t);
@@ -46005,6 +46116,7 @@ int ds4_gpu_hc_expand_add_tensor(
 static int ds4_gpu_hc_expand_split(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
@@ -46021,6 +46133,7 @@ static int ds4_gpu_hc_expand_split(
 
     @autoreleasepool {
         id<MTLBuffer> blockbuf = ds4_gpu_tensor_buffer(block_out);
+        id<MTLBuffer> addbuf = ds4_gpu_tensor_buffer(block_add ? block_add : block_out);
         id<MTLBuffer> resbuf = ds4_gpu_tensor_buffer(residual_hc);
         id<MTLBuffer> splitbuf = ds4_gpu_tensor_buffer(split);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out_hc);
@@ -46053,8 +46166,9 @@ static int ds4_gpu_hc_expand_split(
         const uint64_t block_bytes = n_tokens64 * block_values * sizeof(float);
         const uint64_t hc_bytes = n_tokens64 * hc_values * sizeof(float);
         const uint64_t split_bytes = n_tokens64 * mix_hc * sizeof(float);
-        if (!blockbuf || !resbuf || !splitbuf || !outbuf ||
+        if (!blockbuf || !addbuf || !resbuf || !splitbuf || !outbuf ||
             ds4_gpu_tensor_bytes(block_out) < block_bytes ||
+            (block_add && ds4_gpu_tensor_bytes(block_add) < block_bytes) ||
             ds4_gpu_tensor_bytes(residual_hc) < hc_bytes ||
             ds4_gpu_tensor_bytes(split) < split_bytes) {
             fprintf(stderr, "ds4: Metal HC expand split received undersized activation buffers\n");
@@ -46080,7 +46194,7 @@ static int ds4_gpu_hc_expand_split(
             .nb0 = sizeof(float),
             .nb1 = (uint64_t)n_embd * sizeof(float),
             .nb2 = (uint64_t)n_hc * n_embd * sizeof(float),
-            .has_add = 0,
+            .has_add = block_add != NULL,
             .bf16 = bf16,
         };
         id<MTLComputePipelineState> expand_pipeline = g_hc_expand_pipeline;
@@ -46110,7 +46224,7 @@ static int ds4_gpu_hc_expand_split(
         [enc setBuffer:resbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:2];
         [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float) atIndex:3];
         [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float) atIndex:4];
-        [enc setBuffer:blockbuf offset:ds4_gpu_tensor_offset(block_out) atIndex:5];
+        [enc setBuffer:addbuf offset:ds4_gpu_tensor_offset(block_add ? block_add : block_out) atIndex:5];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_hc) atIndex:6];
         [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
@@ -46129,7 +46243,7 @@ int ds4_gpu_hc_expand_split_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    return ds4_gpu_hc_expand_split(out_hc, block_out, residual_hc, split, n_embd, n_hc, false);
+    return ds4_gpu_hc_expand_split(out_hc, block_out, NULL, residual_hc, split, n_embd, n_hc, false);
 }
 
 /* Unlike CUDA, the block is also rounded on load, so it may be unrounded. */
@@ -46137,7 +46251,14 @@ int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
         const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
         uint32_t width, uint32_t rows) {
     return out && ds4_gpu_tensor_bytes(out) == (uint64_t)width * 4u * rows * sizeof(float) &&
-        ds4_gpu_hc_expand_split(out, block, residual, split, width, 4, true);
+        ds4_gpu_hc_expand_split(out, block, NULL, residual, split, width, 4, true);
+}
+
+int ds4_gpu_dsv41_hc_expand_add(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *add, const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *split, uint32_t width) {
+    return out && ds4_gpu_tensor_bytes(out) == (uint64_t)width * 4u * sizeof(float) &&
+        ds4_gpu_hc_expand_split(out, block, add, residual, split, width, 4, true);
 }
 
 int ds4_gpu_hc_expand_split_half_tensor(
@@ -47909,14 +48030,9 @@ static bool dsv41_tensor_has_floats(const ds4_gpu_tensor *tensor, uint64_t count
 /* Frequency rounding errors accumulate into phase errors at long contexts.
  * Preserve the reference's pow/reciprocal and YaRN operation order here. */
 #pragma float_control(precise, on, push)
-int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
-                             uint32_t rows, uint32_t start, uint32_t stride,
-                             bool compressed, bool inverse) {
-    if (width < 64 || !heads || !rows || rows > 1048576 || !stride ||
-        (uint64_t)start + (uint64_t)(rows - 1u) * stride >= 1048576u ||
-        (uint64_t)heads * rows > UINT64_MAX / width ||
-        !dsv41_tensor_has_floats(x, (uint64_t)width * heads * rows)) return 0;
-    if (!g_initialized && !ds4_gpu_init()) return 0;
+static ds4_gpu_dsv41_rope_args dsv41_rope_args(uint32_t width, uint32_t heads,
+                                               uint32_t rows, uint32_t start, uint32_t stride,
+                                               bool compressed, bool inverse) {
     static float frequencies[2][32];
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -47938,14 +48054,25 @@ int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
             }
         }
     });
+    ds4_gpu_dsv41_rope_args args = {width, heads, rows, start, inverse, stride, {0}};
+    memcpy(args.frequencies, frequencies[compressed ? 1 : 0], sizeof(args.frequencies));
+    return args;
+}
+#pragma float_control(pop)
+
+int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                             uint32_t rows, uint32_t start, uint32_t stride,
+                             bool compressed, bool inverse) {
+    if (width < 64 || !heads || !rows || rows > 1048576 || !stride ||
+        (uint64_t)start + (uint64_t)(rows - 1u) * stride >= 1048576u ||
+        (uint64_t)heads * rows > UINT64_MAX / width ||
+        !dsv41_tensor_has_floats(x, (uint64_t)width * heads * rows)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_rope");
         if (!pipeline) return 0;
-        struct {
-            uint32_t width, heads, rows, start, inverse, stride;
-            float frequencies[32];
-        } args = {width, heads, rows, start, inverse, stride, {0}};
-        memcpy(args.frequencies, frequencies[compressed ? 1 : 0], sizeof(args.frequencies));
+        const ds4_gpu_dsv41_rope_args args =
+            dsv41_rope_args(width, heads, rows, start, stride, compressed, inverse);
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
@@ -47959,7 +48086,11 @@ int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 unit-magnitude RoPE");
     }
 }
-#pragma float_control(pop)
+
+void ds4_gpu_dsv41_rope_next_heads(uint32_t width, uint32_t start, bool compressed) {
+    g_dsv41_heads_rope = dsv41_rope_args(width, 1, 1, start, 1, compressed, true);
+    g_dsv41_heads_rope_armed = 1;
+}
 
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse) {

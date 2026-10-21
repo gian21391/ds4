@@ -37,6 +37,16 @@ int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
         const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
         uint32_t width, uint32_t rows);
 #endif
+#ifdef __APPLE__
+/* Metal decode-row fusions: the HC sum (4 pre weights) with its norm, and the
+ * expand of block + add with add rounded to BF16 before the addition. */
+int ds4_gpu_dsv41_hc_sum_norm(ds4_gpu_tensor *out, ds4_gpu_tensor *sum,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *weights,
+        const void *map, uint64_t size, uint64_t offset, uint32_t width, float eps);
+int ds4_gpu_dsv41_hc_expand_add(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *add, const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *split, uint32_t width);
+#endif
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /* Q8 shared expert (CUDA: scalar stream; Metal: concurrent with the routed
  * experts, single device). 1: queued; 0: unsupported, no work queued;
@@ -63,6 +73,16 @@ int ds4_gpu_dsv41_shared_join(void);
 int ds4_gpu_dsv41_shared_mask(ds4_gpu_tensor *shared, const ds4_gpu_tensor *selected,
         uint32_t width, uint32_t rows, uint32_t experts, uint32_t active,
         uint32_t rank, uint32_t tie_owner);
+#endif
+#ifdef __APPLE__
+/* Decode attention output side: the next decode attention's reduce stores
+ * the heads in BF16 and applies the inverse RoPE; the Q8 low projection
+ * stores BF16. */
+void ds4_gpu_dsv41_rope_next_heads(uint32_t width, uint32_t start, bool compressed);
+int ds4_gpu_dsv41_attention_output_low(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups, const ds4_gpu_tensor *heads);
 #endif
 /* Full-head prefill, with BF16 rounding between the two Q8 projections. */
 int ds4_gpu_dsv41_attention_output_batch(

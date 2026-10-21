@@ -3389,7 +3389,9 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
 // The generic GGML-style id matvec supports arbitrary routed expert ids.  Here
 // the id is always equal to the group number, so this wrapper keeps the exact
 // Q8_0 dot kernel but removes the id-buffer load and the CPU-side id table.
-kernel void kernel_dsv4_attn_out_low_q8_0_f32(
+// The V4.1 variant stores the result rounded to BF16.
+template<bool BF16>
+kernel void kernel_dsv4_attn_out_low_q8_0(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
@@ -3433,7 +3435,7 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         /*.r3   =*/ 1,
     };
 
-    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &>(
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, BF16>(
         args0,
         src0_cur,
         src1_cur,
@@ -3443,6 +3445,11 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         tiisg,
         sgitg);
 }
+
+typedef decltype(kernel_dsv4_attn_out_low_q8_0<false>) kernel_dsv4_attn_out_low_q8_0_t;
+
+template [[host_name("kernel_dsv4_attn_out_low_q8_0_f32")]]   kernel kernel_dsv4_attn_out_low_q8_0_t kernel_dsv4_attn_out_low_q8_0<false>;
+template [[host_name("kernel_dsv41_attn_out_low_q8_0_bf16")]] kernel kernel_dsv4_attn_out_low_q8_0_t kernel_dsv4_attn_out_low_q8_0<true>;
 
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         constant ds4_metal_args_mul_mv_id & args,
@@ -3569,6 +3576,12 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_f32(
         sgitg);
 }
 
+// Exact float of an integer below 2^23: OR'ed into the mantissa of 2^23 and
+// 2^23 subtracted.  Cheaper than the int-to-float convert in the decode loops.
+static inline float ds4_small_uint_to_f32(uint x) {
+    return as_type<float>(0x4B000000u | x) - 8388608.0f;
+}
+
 // Decode-only routed expert gate/up projection fused with the DS4 activation:
 //
 //     mid = silu(clamp(gate)) * clamp(up) * route_weight
@@ -3665,10 +3678,13 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
                 const uint8_t signg = ig | ((popcount(ig) & 1) << 7);
                 const uint iu = (aux32u >> 7 * l) & 127;
                 const uint8_t signu = iu | ((popcount(iu) & 1) << 7);
+                // The rounded product is negated, as the sign multiply did.
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8 * l + j];
-                    sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
-                    su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    const float pg = v * ds4_small_uint_to_f32(gridg[j]);
+                    const float pu = v * ds4_small_uint_to_f32(gridu[j]);
+                    sg += signg & ds4_metal_kmask_iq2xs[j] ? -pg : pg;
+                    su += signu & ds4_metal_kmask_iq2xs[j] ? -pu : pu;
                 }
             }
             sumg[row] += dg * sg;
@@ -5950,14 +5966,14 @@ kernel void kernel_mul_mv_id_q2_K_sum6_f32(
                     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
                     for (int i = 0; i < 8; i += 2) {
-                        acc1[0] += yl[i+ 0] * (qs[i/2] & 0x0003);
-                        acc2[0] += yl[i+ 1] * (qs[i/2] & 0x0300);
-                        acc1[1] += yl[i+ 8] * (qs[i/2] & 0x000c);
-                        acc2[1] += yl[i+ 9] * (qs[i/2] & 0x0c00);
-                        acc1[2] += yl[i+16] * (qs[i/2] & 0x0030);
-                        acc2[2] += yl[i+17] * (qs[i/2] & 0x3000);
-                        acc1[3] += yl[i+24] * (qs[i/2] & 0x00c0);
-                        acc2[3] += yl[i+25] * (qs[i/2] & 0xc000);
+                        acc1[0] += yl[i+ 0] * ds4_small_uint_to_f32(qs[i/2] & 0x0003);
+                        acc2[0] += yl[i+ 1] * ds4_small_uint_to_f32(qs[i/2] & 0x0300);
+                        acc1[1] += yl[i+ 8] * ds4_small_uint_to_f32(qs[i/2] & 0x000c);
+                        acc2[1] += yl[i+ 9] * ds4_small_uint_to_f32(qs[i/2] & 0x0c00);
+                        acc1[2] += yl[i+16] * ds4_small_uint_to_f32(qs[i/2] & 0x0030);
+                        acc2[2] += yl[i+17] * ds4_small_uint_to_f32(qs[i/2] & 0x3000);
+                        acc1[3] += yl[i+24] * ds4_small_uint_to_f32(qs[i/2] & 0x00c0);
+                        acc2[3] += yl[i+25] * ds4_small_uint_to_f32(qs[i/2] & 0xc000);
                     }
                     float dall = dh[0];
                     float dmin = dh[1] * 1.f/16.f;
