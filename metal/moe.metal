@@ -3448,6 +3448,25 @@ kernel void kernel_dsv4_attn_out_low_q8_0(
 
 typedef decltype(kernel_dsv4_attn_out_low_q8_0<false>) kernel_dsv4_attn_out_low_q8_0_t;
 
+// The F32 attention output low projection for up to four tokens per
+// threadgroup (ne12 tokens, nei1 groups of four), reading each group's
+// weights once with the per-token arithmetic of the kernel above.
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_rows4(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int idx = tgpig.z%args.nei0;
+    kernel_mul_mv_q8_0_f32_rows4_impl(args.ne00, args.ne01, args.nb01, args.nb12,
+        args.ne1*args.ne0, args.ne12, (tgpig.z/args.nei0)*4,
+        src0s + idx*args.nb02, src1 + idx*args.nb11, dst + idx*args.ne0*sizeof(float),
+        shmem, tgpig.x, tiisg, sgitg);
+}
+
 template [[host_name("kernel_dsv4_attn_out_low_q8_0_f32")]]   kernel kernel_dsv4_attn_out_low_q8_0_t kernel_dsv4_attn_out_low_q8_0<false>;
 template [[host_name("kernel_dsv41_attn_out_low_q8_0_bf16")]] kernel kernel_dsv4_attn_out_low_q8_0_t kernel_dsv4_attn_out_low_q8_0<true>;
 

@@ -84,14 +84,17 @@ int ds4_gpu_dsv41_shared_mask(ds4_gpu_tensor *shared, const ds4_gpu_tensor *sele
 #ifdef __APPLE__
 /* Decode attention over the raw window ring and the selected compressed rows,
  * gathered in place. It ropes q and stores kv in the window; its reduce stores
- * the heads in BF16 and applies the inverse RoPE. */
+ * the heads in BF16 and applies the inverse RoPE. The partials and the reduce
+ * can be encoded separately, so several rows (each with its own scratch slot)
+ * share one concurrent level of each. */
 int ds4_gpu_dsv41_attention_decode(ds4_gpu_tensor *heads, const void *model_map,
                                   uint64_t model_size, uint64_t sinks_offset,
                                   const ds4_gpu_tensor *q, const ds4_gpu_tensor *kv,
                                   ds4_gpu_tensor *raw, uint32_t n_raw, uint32_t raw_cap,
                                   const ds4_gpu_tensor *comp, const ds4_gpu_tensor *ids,
                                   uint32_t comp_rows, uint32_t n_comp, uint32_t n_head,
-                                  uint32_t pos, bool compressed);
+                                  uint32_t pos, bool compressed,
+                                  uint32_t slot, bool partials, bool reduce_heads);
 /* Decode attention output side: the Q8 low projection stores BF16. */
 int ds4_gpu_dsv41_attention_output_low(
         ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
@@ -146,14 +149,15 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            uint32_t width, uint32_t rows, float eps);
 /* Engram KV projection, BF16-rounded, from the FP8 repack of its F16 weight
  * (e4m3 bytes plus one power-of-two scale per 32x32 block); exactly equal to
- * the F16 matvec followed by BF16 rounding. */
+ * the F16 matvec followed by BF16 rounding, for each of rows inputs. */
 int ds4_gpu_dsv41_engram_kv_fp8(ds4_gpu_tensor *out, const ds4_gpu_tensor *weight,
                                const ds4_gpu_tensor *scales, const ds4_gpu_tensor *x,
-                               uint32_t width, uint32_t outputs);
+                               uint32_t width, uint32_t outputs, uint32_t rows);
 /* Router logits from the BF16 repack of the F32 router weight; exactly equal
  * to the F32 matvec. */
 int ds4_gpu_dsv41_router_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *weight,
-                             const ds4_gpu_tensor *x, uint32_t width, uint32_t outputs);
+                             const ds4_gpu_tensor *x, uint32_t width, uint32_t outputs,
+                             uint32_t rows);
 /* Pool complete pairs and retain the last unpaired projection in previous_*.
  * start is the absolute token position, including earlier chunks. */
 int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,

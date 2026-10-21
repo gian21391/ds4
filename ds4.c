@@ -41772,42 +41772,73 @@ static bool ds41_attention_publish_level(ds41_gpu_graph *g, const ds4_model *m,
  * multi-kernel helpers are spelled out. The Metal BF16 norms also round their
  * matmul inputs on load, and the attention and the index scoring round q
  * and the index q as they rope them. Outside a batch the same order runs
- * serially. A session batch passes projected after making qr, kv and q for
- * all its rows with ds41_attention_project_rows. */
-static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
-                                    const ds4_layer_weights *l, uint32_t il, bool projected) {
-    const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+ * serially. A session batch passes projected after making qr, kv, q and the
+ * index and compressor projections for all its rows with
+ * ds41_attention_project_rows. */
+static bool ds41_attention_project_level(ds41_gpu_graph *g, const ds4_model *m,
+                                         const ds4_layer_weights *l, uint32_t il,
+                                         bool projected, int level) {
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool index = ratio && (g->pos + 1u) / ratio && ds41_index_source(il);
-    const bool compress = ds41_kv_source(il) && (g->pos + 1u) % ratio == 0;
+    if (level == 0)
+        return (projected || (ds41_matmul(g->qr, m, l->attn_q_a, g->norm, false) &&
+            ds41_matmul(g->kv, m, l->attn_kv, g->norm, false))) &&
+            ds41_hc_mix_stage(g, m, l, false, 0) &&
+            (projected || ((!index || ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, false)) &&
+             ds41_attention_publish_level(g, m, l, il, 0)));
+    if (level == 1)
+        return (projected || (ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
+            ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm))) && ds41_hc_mix_stage(g, m, l, false, 1) &&
+            (!index || ds41_bf16(g->index_weights, (uint32_t)l->indexer_proj->dim[1])) &&
+            ds41_attention_publish_level(g, m, l, il, 1);
+    if (level > 2) return ds41_attention_publish_level(g, m, l, il, level);
+    const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
     uint64_t q_row;
     ds4_tensor q_b = *l->attn_q_b;
     if (!tensor_nbytes(q_b.type, q_b.dim[0], &q_row)) return false;
     q_b.abs_offset += (uint64_t)g->tp_rank * q_dim * q_row;
     q_b.dim[1] = q_dim;
-    const bool levels = ds4_gpu_concurrent_begin() != 0;
-    bool ok = (projected || (ds41_matmul(g->qr, m, l->attn_q_a, g->norm, false) &&
-        ds41_matmul(g->kv, m, l->attn_kv, g->norm, false))) &&
-        ds41_hc_mix_stage(g, m, l, false, 0) &&
-        (!index || ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, false)) &&
-        ds41_attention_publish_level(g, m, l, il, 0);
-    ds4_gpu_concurrent_barrier();
-    ok = ok && (projected || (ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
-        ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm))) && ds41_hc_mix_stage(g, m, l, false, 1) &&
-        (!index || ds41_bf16(g->index_weights, (uint32_t)l->indexer_proj->dim[1])) &&
-        ds41_attention_publish_level(g, m, l, il, 1);
-    ds4_gpu_concurrent_barrier();
-    ok = ok && (projected || ds41_matmul(g->q, m, &q_b, g->qr, false)) &&
+    return (projected || ds41_matmul(g->q, m, &q_b, g->qr, false)) &&
         ds4_gpu_dsv41_rope_quantize(g->kv, DS4_N_HEAD_DIM, 1, g->pos, ratio != 0,
                                     DS4_V41_FP8_E8M0) &&
-        (!index || ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, false)) &&
+        (projected || !index || ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, false)) &&
         ds41_attention_publish_level(g, m, l, il, 2);
-    for (int level = 3; compress && level < 7; level++) {
-        ds4_gpu_concurrent_barrier();
-        ok = ok && ds41_attention_publish_level(g, m, l, il, level);
+}
+
+/* Levels 3-6 publish a completed compressed row. */
+static int ds41_attention_project_levels(const ds41_gpu_graph *g, uint32_t il) {
+    return ds41_kv_source(il) && (g->pos + 1u) % ds4_layer_compress_ratio(il) == 0 ? 7 : 3;
+}
+
+static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
+                                    const ds4_layer_weights *l, uint32_t il, bool projected) {
+    const bool levels = ds4_gpu_concurrent_begin() != 0;
+    bool ok = true;
+    for (int level = 0; ok && level < ds41_attention_project_levels(g, il); level++) {
+        if (level) ds4_gpu_concurrent_barrier();
+        ok = ds41_attention_project_level(g, m, l, il, projected, level);
     }
     if (levels) ds4_gpu_concurrent_end();
     return ok;
+}
+
+/* The attention ropes q, stores the window row and reads the selected
+ * compressed rows itself; its reduce rounds the heads and applies the
+ * inverse RoPE. Rows of a session batch keep their partials in their own
+ * slots. */
+static bool ds41_attention_decode(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t il,
+                                  uint32_t slot, bool partials, bool reduce) {
+    const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    const uint32_t heads = DS4_N_HEAD / g->tp_world;
+    const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
+    const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
+    const uint64_t sinks = l->attn_sinks->abs_offset + (uint64_t)g->tp_rank * heads * sizeof(float);
+    return ds4_gpu_dsv41_attention_decode(g->heads, m->map, m->size, sinks,
+            g->q, g->kv, g->window[il], n_raw, 128, g->compressed[owner],
+            g->selected_comp, n_comp, attended, heads, pos, ratio != 0, slot, partials, reduce);
 }
 #else
 static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
@@ -41824,34 +41855,28 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, bool projected) {
-    const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
-    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
-    const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
-    const uint32_t heads = DS4_N_HEAD / g->tp_world;
-    const uint32_t head0 = g->tp_rank * heads;
 #ifdef __APPLE__
     /* The projections publish the compressed KV, and the index scoring runs
      * next; the attention and its reduce form one concurrent section. */
     if (!ds41_attention_project(g, m, l, il, projected) || !ds41_attention_score(g, il)) return false;
     const bool levels = ds4_gpu_concurrent_begin() != 0;
+    const bool ok = ds41_attention_decode(g, m, l, il, 0, true, true);
+    if (levels) ds4_gpu_concurrent_end();
+    if (!ok) return false;
 #else
+    const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    const uint32_t heads = DS4_N_HEAD / g->tp_world;
+    const uint32_t head0 = g->tp_rank * heads;
     if ((!projected && !ds41_attention_project(g, m, l)) ||
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
         !ds41_attention_publish(g, m, l, il) ||
         !ds41_attention_select_published(g, m, l, il)) return false;
-#endif
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
     const uint64_t sinks = l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float);
-#ifdef __APPLE__
-    /* The attention ropes q, stores the window row and reads the selected
-     * compressed rows itself; its reduce rounds the heads and applies the
-     * inverse RoPE. */
-    const bool ok = ds4_gpu_dsv41_attention_decode(g->heads, m->map, m->size, sinks,
-            g->q, g->kv, g->window[il], n_raw, 128, g->compressed[owner],
-            g->selected_comp, n_comp, attended, heads, pos, ratio != 0);
-#else
     const bool ok = ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) &&
         ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
                             g->kv, 0, 512u * 4u) &&
@@ -41860,11 +41885,6 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size, sinks,
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u, g->selected_kv, 0,
             attended, NULL, 0, heads, DS4_N_HEAD_DIM);
-#endif
-#ifdef __APPLE__
-    if (levels) ds4_gpu_concurrent_end();
-    if (!ok) return false;
-#else
     if (!ok || !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
 #endif
@@ -41916,7 +41936,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #ifdef __APPLE__
     if (!(g->router_bf16[il] ?
           ds4_gpu_dsv41_router_bf16(g->route_logits, g->router_bf16[il], g->norm,
-                                    DS4_N_EMBD, DS4_N_EXPERT) :
+                                    DS4_N_EMBD, DS4_N_EXPERT, 1) :
           ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false)) ||
 #else
     if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
@@ -42058,7 +42078,7 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
 #ifdef __APPLE__
         if (!(g->engram_fp8[i] ?
               ds4_gpu_dsv41_engram_kv_fp8(g->engram_kv, g->engram_fp8[i], g->engram_fp8_scale[i], rows,
-                                          (uint32_t)l->engram_kv->dim[0], (uint32_t)l->engram_kv->dim[1]) :
+                                          (uint32_t)l->engram_kv->dim[0], (uint32_t)l->engram_kv->dim[1], 1) :
               ds41_matmul(g->engram_kv, m, l->engram_kv, rows, true)) ||
 #else
         if (!ds41_matmul(g->engram_kv, m, l->engram_kv, rows, true) ||
@@ -42144,16 +42164,23 @@ static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
 
 static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
-                                         uint32_t il, uint32_t count) {
+                                         uint32_t il, uint32_t count, bool mix) {
     if (ds41_engram_layer(il)) {
         const uint32_t i = il == 1 ? 0 : 1;
+#ifdef __APPLE__
+        if (!(g->engram_fp8[i] && count <= DS4_TP_BATCH_MAX_ROWS ?
+              ds4_gpu_dsv41_engram_kv_fp8(b->engram_kv, g->engram_fp8[i], g->engram_fp8_scale[i],
+                  b->engram_rows, (uint32_t)l->engram_kv->dim[0], (uint32_t)l->engram_kv->dim[1], count) :
+              ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true)) ||
+#else
         if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true) ||
+#endif
             !ds4_gpu_dsv41_engram_add(b->residual, b->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], g->image_count ? g->image_text_mask : NULL,
                 DS4_N_EMBD, count, DS4_RMS_EPS))
             return false;
     }
-    if (!ds41_hc_mix_batch(b, m, l, false, count)) return false;
+    if (mix && !ds41_hc_mix_batch(b, m, l, false, count)) return false;
     /* V4.1 consumes the preceding sublayer's mixer, not the newly computed one. */
     const bool mixed = il ?
         ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split, DS4_N_EMBD, DS4_N_HC) :
@@ -42190,12 +42217,15 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 #ifdef __APPLE__
-/* A session batch's q_a, kv and q_b projections and their norms, each weight
- * read once for all rows by the kernels a single session uses, so every row
- * keeps its own values. ds41_attention_project does the rest per row. */
+/* A session batch's attention projections (q_a, kv and q_b with their norms,
+ * the index projections and the compressor's), each weight read once for all
+ * rows by the kernels a single session uses, so every row keeps its own
+ * values. ds41_attention_project does the rest per row. */
 static bool ds41_attention_project_rows(ds41_gpu_graph *g, ds41_prefill_row *b,
                                         const ds4_model *m, const ds4_layer_weights *l,
-                                        uint32_t count) {
+                                        uint32_t il, uint32_t count) {
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const bool index = ratio && ds41_index_source(il);
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
     uint64_t q_row;
     ds4_tensor q_b = *l->attn_q_b;
@@ -42204,12 +42234,77 @@ static bool ds41_attention_project_rows(ds41_gpu_graph *g, ds41_prefill_row *b,
     q_b.dim[1] = q_dim;
     const bool levels = ds4_gpu_concurrent_begin() != 0;
     bool ok = ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, false) &&
-        ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, false);
+        ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, false) &&
+        (!index || ds41_matmul_batch(b->index_weights, m, l->indexer_proj, b->norm, count, false)) &&
+        (!ds41_kv_source(il) ||
+         (ds41_matmul_batch(b->pool_kv, m, l->attn_compressor_kv, b->norm, count, false) &&
+          (ratio != 2 || ds41_matmul_batch(b->pool_score, m, l->attn_compressor_gate, b->norm,
+                                           count, false))));
     ds4_gpu_concurrent_barrier();
     ok = ok && ds41_norm_batch(b->qr, b->qr, m, l->attn_q_a_norm, count) &&
         ds41_norm_batch(b->kv, b->kv, m, l->attn_kv_a_norm, count);
     ds4_gpu_concurrent_barrier();
-    ok = ok && ds41_matmul_batch(b->q, m, &q_b, b->qr, count, false);
+    ok = ok && ds41_matmul_batch(b->q, m, &q_b, b->qr, count, false) &&
+        (!index || ds41_matmul_batch(b->index_q, m, l->indexer_attn_q_b, b->qr, count, false));
+    if (levels) ds4_gpu_concurrent_end();
+    return ok;
+}
+
+/* ds41_attention for the distinct sessions of a batch after
+ * ds41_attention_project_rows: each projection level, and the attention
+ * partials and reduce, run for all rows at once, so their small kernels
+ * overlap instead of queueing one row at a time. */
+static bool ds41_attention_rows(ds41_gpu_graph *rows, uint32_t count, const ds4_model *m,
+                                const ds4_layer_weights *l, uint32_t il) {
+    int project_levels = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const int n = ds41_attention_project_levels(&rows[i], il);
+        if (n > project_levels) project_levels = n;
+    }
+    bool levels = ds4_gpu_concurrent_begin() != 0;
+    bool ok = true;
+    for (int level = 0; ok && level < project_levels; level++) {
+        if (level) ds4_gpu_concurrent_barrier();
+        for (uint32_t i = 0; ok && i < count; i++)
+            ok = ds41_attention_project_level(&rows[i], m, l, il, true, level);
+    }
+    if (levels) ds4_gpu_concurrent_end();
+    for (uint32_t i = 0; ok && i < count; i++) ok = ds41_attention_score(&rows[i], il);
+    levels = ds4_gpu_concurrent_begin() != 0;
+    /* The last slot first: the shared scratch grows before any row uses it. */
+    for (uint32_t i = count; ok && i-- > 0;)
+        ok = ds41_attention_decode(&rows[i], m, l, il, i, true, false);
+    ds4_gpu_concurrent_barrier();
+    for (uint32_t i = 0; ok && i < count; i++)
+        ok = ds41_attention_decode(&rows[i], m, l, il, i, false, true);
+    if (levels) ds4_gpu_concurrent_end();
+    return ok;
+}
+
+/* ds41_graph_after_attention for each row of a session batch, side by side:
+ * the single-session FFN HC mix, sum and norm kernels give every row its own
+ * values, in fewer launches than the batch row kernels. */
+static bool ds41_after_attention_rows(ds41_gpu_graph *g, ds41_prefill_row *b,
+                                      const ds4_model *m, const ds4_layer_weights *l,
+                                      uint32_t count) {
+    bool ok = ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual,
+            b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
+        ds4_gpu_dsv41_quantize(b->after_attn, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+    const bool levels = ds4_gpu_concurrent_begin() != 0;
+    for (uint32_t i = 0; ok && i < count; i++) {
+        const ds41_prefill_row *r = &g->rows_view[i];
+        ok = ds4_gpu_dsv41_hc_mix_partial(r->flat_norm, r->after_attn, m->map, m->size,
+                l->hc_ffn_fn->abs_offset, DS4_N_HC * DS4_N_EMBD) &&
+            ds4_gpu_dsv41_hc_sum_norm(r->norm, r->x, r->after_attn, r->attn_split,
+                m->map, m->size, l->ffn_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS);
+    }
+    ds4_gpu_concurrent_barrier();
+    for (uint32_t i = 0; ok && i < count; i++) {
+        const ds41_prefill_row *r = &g->rows_view[i];
+        ok = ds4_gpu_dsv41_hc_mix_split(r->ffn_split, r->flat_norm, m->map, m->size,
+            l->hc_ffn_scale->abs_offset, l->hc_ffn_base->abs_offset, DS4_N_HC * DS4_N_EMBD,
+            DS4_N_HC_SINKHORN_ITER, DS4_RMS_EPS, DS4_HC_EPS);
+    }
     if (levels) ds4_gpu_concurrent_end();
     return ok;
 }
@@ -42524,7 +42619,15 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     const bool balance_shared = shared_owner && ds41_balance_shared(g, l, count);
     bool mid_f16 = false;
-    return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
+#ifdef __APPLE__
+    const bool logits = g->router_bf16[il] && count <= DS4_TP_BATCH_MAX_ROWS ?
+        ds4_gpu_dsv41_router_bf16(b->route_logits, g->router_bf16[il], b->norm,
+                                  DS4_N_EMBD, DS4_N_EXPERT, count) :
+        ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false);
+#else
+    const bool logits = ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false);
+#endif
+    return logits &&
         ds41_route_batch(g, m, l, count) &&
         ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
@@ -43184,7 +43287,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok && batch_hc)
                 ok = ds41_dspark_capture(g->dspark, il, start, active.residual, count) &&
-                    ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count);
+                    ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count, true);
             DS41_STAGE("hc/engram");
             for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                 row.pos = start + t;
@@ -43387,7 +43490,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     ds4_gpu_tensor *queries[DS4_TP_BATCH_MAX_ROWS] = {0};
     ds4_gpu_tensor *heads[DS4_TP_BATCH_MAX_ROWS] = {0};
     bool reading[DS4_TP_BATCH_MAX_ROWS] = {0};
-    bool ok = rows <= g->prefill_cap && (prefill_rows <= 1 || engram);
+    ds41_gpu_graph *row = malloc((size_t)count * sizeof(*row));
+    bool ok = row && rows <= g->prefill_cap && (prefill_rows <= 1 || engram);
 #define DS41_SESSION_VIEW(name, width) \
     if (ok) ok = (active.name = ds4_gpu_tensor_view(g->batch.name, 0, \
         (uint64_t)rows * (width) * sizeof(float))) != NULL;
@@ -43420,6 +43524,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
     }
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
+    for (int i = 0; ok && i < count; i++) {
+        row[i] = *graphs[i];
+        row[i].pos = positions[i];
+#define DS41_SESSION_ROW(name, width) row[i].name = g->rows_view[i].name;
+        DS41_PREFILL_ROWS(DS41_SESSION_ROW)
+#undef DS41_SESSION_ROW
+        /* The batch flat_norm aliases the projected q rows, so the per-row
+         * HC mix uses the session's own scratch. */
+        row[i].flat_norm = graphs[i]->flat_norm;
+        row[i].q = queries[i];
+        row[i].heads = heads[i];
+    }
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
@@ -43436,10 +43552,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         for (int i = 0; ok && i < count; i++)
             ok = ds41_dspark_capture(graphs[i]->dspark, il, positions[i],
                 g->rows_view[i].residual, 1);
-        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
 #ifdef __APPLE__
-            ds41_attention_project_rows(g, &active, model, l, rows);
+        /* Each row's ds41_attention_project makes its attention HC mix. */
+        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows, false) &&
+            ds41_attention_project_rows(g, &active, model, l, il, rows);
 #else
+        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows, true) &&
             ds41_attention_project_batch(g, model, l, rows);
 #endif
         bool batch_output = false;
@@ -43449,20 +43567,19 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
             !getenv("DS4_DISABLE_V41_BATCH_OUTPUT");
 #endif
-        for (int i = 0; ok && i < count; i++) {
-            ds41_gpu_graph row = *graphs[i];
-            row.pos = positions[i];
-#define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
-            DS41_PREFILL_ROWS(DS41_SESSION_ROW)
-#undef DS41_SESSION_ROW
-            /* The batch flat_norm aliases the projected q rows, so the
-             * per-row HC mix uses the session's own scratch. */
-            row.flat_norm = graphs[i]->flat_norm;
-            row.q = queries[i];
-            row.heads = heads[i];
-            ok = ds41_attention(&row, model, l, il, true) &&
-                (batch_output || ds41_attention_output(&row, model, l));
-        }
+#ifdef __APPLE__
+        /* Distinct sessions share each attention level; the rows of one
+         * prefill stay in order. */
+        if (ok && prefill_rows <= 1) ok = ds41_attention_rows(row, rows, model, l, il);
+        for (int i = 0; ok && prefill_rows > 1 && i < count; i++)
+            ok = ds41_attention(&row[i], model, l, il, true);
+        for (int i = 0; ok && !batch_output && i < count; i++)
+            ok = ds41_attention_output(&row[i], model, l);
+#else
+        for (int i = 0; ok && i < count; i++)
+            ok = ds41_attention(&row[i], model, l, il, true) &&
+                (batch_output || ds41_attention_output(&row[i], model, l));
+#endif
         if (ok && batch_output)
             ok = g->tp_world == 2 ?
                 ds4_gpu_dsv41_attention_output_tp_batch(active.block, active.low,
@@ -43473,7 +43590,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                     l->attn_output_b->abs_offset, g->batch.heads, rows);
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
+#ifdef __APPLE__
+            ds41_after_attention_rows(g, &active, model, l, rows) &&
+#else
             ds41_after_attention_batch(&active, model, l, rows) &&
+#endif
             ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
@@ -43534,6 +43655,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ds4_gpu_tensor_free(heads[i]);
     }
     free(engram);
+    free(row);
     return ok;
 }
 

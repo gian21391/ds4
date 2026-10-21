@@ -561,11 +561,17 @@ kernel void kernel_dsv41_router_select_one(
         device int32_t *selected,
         device float *weights,
         threadgroup float *scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
         uint tid [[thread_position_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr int n = 384;
     constexpr int K = 7;
+    /* One threadgroup per token row. */
+    logits += row*n;
+    probs += row*n;
+    selected += row*6;
+    weights += row*6;
     threadgroup float *prob = scratch;
     threadgroup float *score_tg[2] = {scratch + 512, scratch + 1024};
     threadgroup int32_t *idx_tg[2] = {(threadgroup int32_t *)(scratch + 1536),
@@ -675,16 +681,19 @@ kernel void kernel_dsv41_router_select_one(
 // e4m3 bytes, row-major, and one power-of-two float scale per 32x32 block.
 // Each weight decodes to exactly its F16 value; the K walk and reduction
 // tree replicate kernel_mul_mv_f16_f32_4 (nsg=8, nr0=2), then BF16 rounding.
-kernel void kernel_dsv41_engram_kv_fp8(
-        constant uint2 &dims,
+// A threadgroup decodes its weights once for up to four input rows (dims.z
+// rows in all), each with that same walk.
+template<short NR1>
+void kernel_dsv41_engram_kv_fp8_impl(
+        constant uint3 &dims,
         device const uchar * src0,
         device const float * scales,
         device const float4 * y4,
         device       float * dst,
-        threadgroup  char  * shmem [[threadgroup(0)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+        threadgroup  char  * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     constexpr short NSG = 8;
     constexpr short NR0 = 2;
     constexpr short NW  = N_SIMDWIDTH;
@@ -694,6 +703,7 @@ kernel void kernel_dsv41_engram_kv_fp8(
 
     const int nb = dims.x/NB;
     const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y*4;
 
     device const uint4 * ax[NR0];
     device const float * as[NR0];
@@ -702,37 +712,66 @@ kernel void kernel_dsv41_engram_kv_fp8(
         as[row] = scales + (uint64_t)((r0 + row)/32)*nb;
     }
 
-    float sumf[NR0] = { 0.f };
+    float sumf[NR1][NR0] = { { 0.f } };
 
     const short ix = tiisg/(NW/NF);
     const short il = tiisg%(NW/NF);
     const int ib0 = sgitg*NF + ix;
 
-    device const float4 * yb4 = y4 + (ib0*NB + il*NF)/4;
+    device const float4 * yb4 = y4 + ((uint64_t)r1*dims.x + ib0*NB + il*NF)/4;
 
     for (int ib = ib0; ib < nb; ib += NSG*NF) {
-        float4 yl4[NF4];
-        for (short i = 0; i < NF4; ++i) {
-            yl4[i] = yb4[i];
-        }
-
-        for (short row = 0; row < NR0; row++) {
+        float4 xs[NR0][NF4];
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
             const uint4 q = ax[row][(ib*NB + il*NF)/16];
             const float s = as[row][ib];
-
-            float sumq = 0.f;
             FOR_UNROLL (short i = 0; i < NF4; ++i) {
                 /* e4m3 into the top bits of a half: the value times 2^-8. */
                 const ushort4 b = ushort4(as_type<uchar4>(q[i]));
-                const float4 x = float4(as_type<half4>(((b & 0x7fu) << 7) | ((b & 0x80u) << 8)));
-                sumq += dot(x*s, yl4[i]);
+                xs[row][i] = float4(as_type<half4>(((b & 0x7fu) << 7) | ((b & 0x80u) << 8)))*s;
+            }
+        }
+
+        FOR_UNROLL (short j = 0; j < NR1; ++j) {
+            float4 yl4[NF4];
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                yl4[i] = yb4[j*dims.x/4 + i];
             }
 
-            sumf[row] += sumq;
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                    sumq += dot(xs[row][i], yl4[i]);
+                }
+
+                sumf[j][row] += sumq;
+            }
         }
 
         yb4 += NSG*NF*NW/4;
     }
 
-    helper_mv_reduce_and_write<NR0, true>(dst, sumf, r0, dims.y, tiisg, sgitg, shmem);
+    FOR_UNROLL (short j = 0; j < NR1; ++j) {
+        helper_mv_reduce_and_write<NR0, true>(dst + (uint64_t)(r1 + j)*dims.y, sumf[j],
+                                              r0, dims.y, tiisg, sgitg, shmem);
+        if (j + 1 < NR1) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void kernel_dsv41_engram_kv_fp8(
+        constant uint3 &dims,
+        device const uchar * src0,
+        device const float * scales,
+        device const float4 * y4,
+        device       float * dst,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    switch (min(4, (int)dims.z - (int)tgpig.y*4)) {
+        case 4: kernel_dsv41_engram_kv_fp8_impl<4>(dims, src0, scales, y4, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 3: kernel_dsv41_engram_kv_fp8_impl<3>(dims, src0, scales, y4, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 2: kernel_dsv41_engram_kv_fp8_impl<2>(dims, src0, scales, y4, dst, shmem, tgpig, tiisg, sgitg); break;
+        default: kernel_dsv41_engram_kv_fp8_impl<1>(dims, src0, scales, y4, dst, shmem, tgpig, tiisg, sgitg); break;
+    }
 }
