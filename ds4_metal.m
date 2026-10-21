@@ -19856,6 +19856,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         if (!wbuf) return 0;
 
         ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        dispatch.function_name = "kernel_mul_mv_q8_0_f32_rows4";
         if (out_dim > 65536u) dispatch.nsg = 8;
         ds4_gpu_q8_0_matvec_args args =
             ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
@@ -19883,7 +19884,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                 MTLSizeMake(((NSUInteger)out_dim +
                              (NSUInteger)dispatch.nr0 - 1u) /
                                 (NSUInteger)dispatch.nr0,
-                            (NSUInteger)n_rows,
+                            ((NSUInteger)n_rows + 3u) / 4u,
                             1)
              threadsPerThreadgroup:
                 MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];

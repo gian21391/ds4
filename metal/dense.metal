@@ -211,6 +211,81 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Q8_0 matvec over up to four activation rows per threadgroup: each weight
+// block is read once for all rows, while every row keeps the K walk and
+// reduction tree of kernel_mul_mv_q8_0_f32_impl, so it gets the single-row
+// result. Session batches use it for their dense projections.
+[[host_name("kernel_mul_mv_q8_0_f32_rows4")]]
+kernel void kernel_mul_mv_q8_0_f32_rows4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NR0 = N_R0_Q8_0;
+    constexpr short NR1 = 4;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00/QK8_0;
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y*NR1;
+    const int nr1 = min((int)NR1, args.ne11 - r1);
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *) (src0 + (r0 + row)*args.nb01);
+    }
+
+    float sumf[NR1][NR0] = { { 0.f } };
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+
+    const int ib0 = sgitg*NQ + ix;
+
+    device const char * yb = src1 + r1*args.nb11 + (ib0*QK8_0 + il*NQ)*sizeof(float);
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        FOR_UNROLL (short j = 0; j < NR1; ++j) {
+            if (j < nr1) {
+                device const float * y = (device const float *) (yb + j*args.nb11);
+                float yl[NQ];
+                for (short i = 0; i < NQ; ++i) {
+                    yl[i] = y[i];
+                }
+
+                for (short row = 0; row < NR0; row++) {
+                    device const int8_t * qs = ax[row][ib].qs + il*NQ;
+
+                    float sumq = 0.f;
+                    FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                        sumq += qs[i] * yl[i];
+                    }
+
+                    sumf[j][row] += sumq*ax[row][ib].d;
+                }
+            }
+        }
+
+        yb += NSG*NQ*QK8_0*sizeof(float);
+    }
+
+    FOR_UNROLL (short j = 0; j < NR1; ++j) {
+        if (j < nr1) {
+            device float * dst_f32 = (device float *) dst + (uint64_t)(r1 + j)*args.ne0;
+            helper_mv_reduce_and_write<NR0>(dst_f32, sumf[j], r0, args.ne01, tiisg, sgitg, shmem);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
 // poll-gate flag published by the last-arriving threadgroup (see
