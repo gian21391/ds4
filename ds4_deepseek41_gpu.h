@@ -132,12 +132,28 @@ int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
 int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                              uint32_t rows, uint32_t start, uint32_t stride,
                              bool compressed, bool inverse);
+/* BF16 rounding, then the RoPE of one row, then the FP8 or FP4 E8M0
+ * quantization, as ds4_gpu_dsv41_quantize, ds4_gpu_dsv41_rope and
+ * ds4_gpu_dsv41_quantize in turn. */
+int ds4_gpu_dsv41_rope_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                               uint32_t start, bool compressed,
+                               ds4_v41_activation_format format);
 int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            const ds4_gpu_tensor *kv,
                            const ds4_gpu_tensor *q_weight,
                            const ds4_gpu_tensor *k_weight,
                            const ds4_gpu_tensor *mask,
                            uint32_t width, uint32_t rows, float eps);
+/* Engram KV projection, BF16-rounded, from the FP8 repack of its F16 weight
+ * (e4m3 bytes plus one power-of-two scale per 32x32 block); exactly equal to
+ * the F16 matvec followed by BF16 rounding. */
+int ds4_gpu_dsv41_engram_kv_fp8(ds4_gpu_tensor *out, const ds4_gpu_tensor *weight,
+                               const ds4_gpu_tensor *scales, const ds4_gpu_tensor *x,
+                               uint32_t width, uint32_t outputs);
+/* Router logits from the BF16 repack of the F32 router weight; exactly equal
+ * to the F32 matvec. */
+int ds4_gpu_dsv41_router_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *weight,
+                             const ds4_gpu_tensor *x, uint32_t width, uint32_t outputs);
 /* Pool complete pairs and retain the last unpaired projection in previous_*.
  * start is the absolute token position, including earlier chunks. */
 int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,

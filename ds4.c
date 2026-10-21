@@ -40987,7 +40987,8 @@ typedef struct {
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
     ds4_gpu_tensor *verify_previous_kv[4], *verify_previous_score[4];
     bool verify_prefix;
-    ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
+    ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2], *engram_fp8[2], *engram_fp8_scale[2];
+    ds4_gpu_tensor *router_bf16[40];
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
@@ -40996,6 +40997,127 @@ typedef struct {
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
 } ds41_gpu_graph;
+
+#ifdef __APPLE__
+/* The released Engram projection is FP8 (e4m3) with power-of-two scales per
+ * 32x32 block; the GGUF stores its exact F16 dequantization. Recover the
+ * bytes and scales for decode, halving its weight reads. A block whose
+ * values are not exactly representable leaves the F16 path in place. */
+typedef struct {
+    const uint16_t *w;
+    uint8_t *q;
+    float *scales;
+    uint32_t width;
+    bool exact;
+} ds41_engram_fp8_job;
+
+static bool ds41_e4m3_encode(float v, uint8_t *out) {
+    const uint8_t sign = signbit(v) ? 0x80u : 0u;
+    const float a = fabsf(v);
+    int e;
+    if (a == 0) {
+        *out = sign;
+        return true;
+    }
+    frexpf(a, &e);
+    const bool normal = e - 1 >= -6;
+    const float mf = normal ? (ldexpf(a, 1 - e) - 1.0f) * 8.0f : ldexpf(a, 9);
+    const int mant = (int)mf;
+    if ((float)mant != mf || e - 1 > 8 || (e - 1 == 8 && mant == 7)) return false;
+    *out = sign | (uint8_t)(normal ? (e - 1 + 7) << 3 : 0) | (uint8_t)mant;
+    return true;
+}
+
+static void ds41_engram_fp8_rows(void *ctx, uint64_t b0, uint64_t b1) {
+    ds41_engram_fp8_job *job = ctx;
+    const uint32_t width = job->width;
+    for (uint64_t rb = b0; rb < b1 && job->exact; rb++) {
+        for (uint32_t cb = 0; cb < width / 32u; cb++) {
+            int top = INT_MIN;
+            for (uint64_t r = rb * 32u; r < rb * 32u + 32u; r++) {
+                for (uint32_t c = cb * 32u; c < cb * 32u + 32u; c++) {
+                    const float v = f16_to_f32(job->w[r * width + c]);
+                    int e;
+                    if (v != 0 && (frexpf(v, &e), e - 1 > top)) top = e - 1;
+                }
+            }
+            /* 448 = 1.75 * 2^8 is the largest e4m3 value. */
+            bool ok = false;
+            int scale = 0;
+            for (int span = 8; !ok && span >= 7; span--) {
+                scale = top - span;
+                ok = true;
+                for (uint64_t r = rb * 32u; ok && r < rb * 32u + 32u; r++) {
+                    for (uint32_t c = cb * 32u; ok && c < cb * 32u + 32u; c++) {
+                        ok = ds41_e4m3_encode(ldexpf(f16_to_f32(job->w[r * width + c]), -scale),
+                                              &job->q[r * width + c]);
+                    }
+                }
+            }
+            if (!ok) {
+                job->exact = false;
+                return;
+            }
+            /* The kernel decodes e4m3 into a half, which carries 2^-8. */
+            job->scales[rb * (width / 32u) + cb] = ldexpf(1.0f, scale + 8);
+        }
+    }
+}
+
+static bool ds41_engram_fp8_pack(ds41_gpu_graph *g, const ds4_model *m,
+                                 const ds4_tensor *weight, uint32_t i) {
+    const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
+    g->engram_fp8[i] = ds4_gpu_tensor_alloc((uint64_t)width * outputs);
+    g->engram_fp8_scale[i] = ds4_gpu_tensor_alloc((uint64_t)width / 32u * (outputs / 32u) * sizeof(float));
+    ds41_engram_fp8_job job = {
+        .w = tensor_data(m, weight), .width = width, .exact = true,
+        .q = g->engram_fp8[i] ? ds4_gpu_tensor_contents(g->engram_fp8[i]) : NULL,
+        .scales = g->engram_fp8_scale[i] ? ds4_gpu_tensor_contents(g->engram_fp8_scale[i]) : NULL,
+    };
+    if (!job.q || !job.scales) return false;
+    ds4_parallel_for_min_rows(outputs / 32u, ds41_engram_fp8_rows, &job, 1);
+    if (!job.exact) {
+        ds4_gpu_tensor_free(g->engram_fp8[i]);
+        ds4_gpu_tensor_free(g->engram_fp8_scale[i]);
+        g->engram_fp8[i] = g->engram_fp8_scale[i] = NULL;
+    }
+    return true;
+}
+
+/* The released router weights are BF16 values stored as F32. Keep their
+ * BF16 halves for decode, halving the router reads; a weight with any low
+ * mantissa bit set keeps the F32 path. */
+typedef struct {
+    const uint32_t *w;
+    uint16_t *out;
+    bool exact;
+} ds41_router_bf16_job;
+
+static void ds41_router_bf16_rows(void *ctx, uint64_t r0, uint64_t r1) {
+    ds41_router_bf16_job *job = ctx;
+    for (uint64_t i = r0 * DS4_N_EMBD; i < r1 * DS4_N_EMBD && job->exact; i++) {
+        if (job->w[i] & 0xffffu) job->exact = false;
+        job->out[i] = (uint16_t)(job->w[i] >> 16);
+    }
+}
+
+static bool ds41_router_bf16_pack(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_tensor *weight, uint32_t il) {
+    if (weight->type != DS4_TENSOR_F32) return true;
+    g->router_bf16[il] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * DS4_N_EXPERT * sizeof(uint16_t));
+    ds41_router_bf16_job job = {
+        .w = tensor_data(m, weight), .exact = true,
+        .out = g->router_bf16[il] ? ds4_gpu_tensor_contents(g->router_bf16[il]) : NULL,
+    };
+    if (!job.out) return false;
+    ds4_parallel_for_min_rows(DS4_N_EXPERT, ds41_router_bf16_rows, &job, 1);
+    if (!job.exact) {
+        ds4_gpu_tensor_free(g->router_bf16[il]);
+        g->router_bf16[il] = NULL;
+    }
+    return true;
+}
+#endif
 
 static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
                             uint64_t count, void *out, size_t bytes) {
@@ -41028,8 +41150,13 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
         ds4_engram_table_close(&g->table[i]);
         ds4_gpu_tensor_free(g->engram_q_norm[i]);
         ds4_gpu_tensor_free(g->engram_k_norm[i]);
+        ds4_gpu_tensor_free(g->engram_fp8[i]);
+        ds4_gpu_tensor_free(g->engram_fp8_scale[i]);
     }
-    for (uint32_t i = 0; i < 40; i++) ds4_gpu_tensor_free(g->window[i]);
+    for (uint32_t i = 0; i < 40; i++) {
+        ds4_gpu_tensor_free(g->window[i]);
+        ds4_gpu_tensor_free(g->router_bf16[i]);
+    }
     for (uint32_t i = 0; i < 4; i++) {
         ds4_gpu_tensor_free(g->compressed[i]);
         ds4_gpu_tensor_free(g->index_cache[i]);
@@ -41148,10 +41275,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
         if (!g->engram_q_norm[i] || !g->engram_k_norm[i] ||
             !ds4_gpu_tensor_write(g->engram_q_norm[i], 0, tensor_data(m, w->layer[il].engram_q_norm), bytes) ||
             !ds4_gpu_tensor_write(g->engram_k_norm[i], 0, tensor_data(m, w->layer[il].engram_k_norm), bytes)) goto fail;
+#ifdef __APPLE__
+        if (!ds41_engram_fp8_pack(g, m, w->layer[il].engram_kv, i)) goto fail;
+#endif
     }
     for (uint32_t i = 0; i < 40; i++) {
         g->window[i] = ds4_gpu_tensor_alloc(128u * 512u * sizeof(float));
         if (!g->window[i]) goto fail;
+#ifdef __APPLE__
+        if (!ds41_router_bf16_pack(g, m, w->layer[i].ffn_gate_inp, i)) goto fail;
+#endif
     }
     for (uint32_t i = 0; i < 4; i++) {
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
@@ -41543,12 +41676,13 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
         if (il == 20) {
             const uint32_t blocks = (n_comp + 7u) / 8u, top = blocks < 2048u ? blocks : 2048u;
             /* Below the block cap every block survives. Their sorted order
-             * is unused; only the mask is consumed by subsequent layers. */
+             * is unused; only the mask is consumed by subsequent layers,
+             * which skip the filter while the mask keeps every block. */
             if (top == blocks) return ds4_gpu_tensor_fill_f32(g->block_mask, 0, blocks) != 0;
             if (!ds4_gpu_dsv41_candidate_blocks(g->block_scores, g->index_scores, n_comp, 1, pos, ratio) ||
                 !ds4_gpu_indexer_topk_tensor(g->block_selected, g->block_scores, blocks, 1, top) ||
                 !ds4_gpu_dsv4_topk_mask_tensor(g->block_mask, g->block_selected, blocks, 1, top)) return false;
-        } else if (il > 20 &&
+        } else if (il > 20 && (n_comp + 7u) / 8u > 2048u &&
             !ds4_gpu_dsv41_candidate_filter(g->index_scores, g->block_mask, n_comp, 1, pos, ratio)) return false;
     }
     return true;
@@ -41569,12 +41703,14 @@ static bool ds41_attention_score(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     if (n_comp && ds41_index_source(il)) {
-        if (!ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
-            !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
 #ifdef __APPLE__
+        if (!ds4_gpu_dsv41_rope_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, pos, true,
+                                         DS4_V41_FP4_E8M0) ||
             !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
 #else
+        if (!ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
+            !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
             !ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, 1, pos, ratio)) return false;
 #endif
@@ -41593,18 +41729,56 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
 }
 
 #ifdef __APPLE__
-/* The kv chain (through its RoPE and FP8 rounding) and the index weights read
- * only g->norm, the index q only the final qr, and the attention HC mix (left
- * out of ds41_graph_before_attention) only the residual, so all run beside
- * the q chain in concurrent levels. A barrier waits for every earlier
- * dispatch: each level holds independent kernels, so multi-kernel helpers
- * are spelled out. The Metal BF16 norms also round their matmul inputs on
- * load. Outside a batch the same order runs serially. */
+/* One concurrent level of ds41_attention_publish. The norms round the
+ * unrounded projections on load, and the normalized index key and latent go
+ * straight to their cache rows, which are then roped and rounded in place. */
+static bool ds41_attention_publish_level(ds41_gpu_graph *g, const ds4_model *m,
+                                         const ds4_layer_weights *l, uint32_t il, int level) {
+    const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    if (!ds41_kv_source(il)) return true;
+    if (level == 0) return ds41_matmul(g->pool_kv, m, l->attn_compressor_kv, g->norm, false) &&
+        (ratio != 2 || ds41_matmul(g->pool_score, m, l->attn_compressor_gate, g->norm, false));
+    if (level == 1) return ratio != 2 || ds4_gpu_dsv41_pool2(g->latent, g->pool_kv, g->pool_score,
+        g->previous_kv[owner], g->previous_score[owner], 512, 1, pos);
+    if (level == 2 && g->verify_prefix &&
+        (!ds4_gpu_tensor_copy(g->verify_previous_kv[owner], 0, g->previous_kv[owner], 0, 512u * 4u) ||
+         !ds4_gpu_tensor_copy(g->verify_previous_score[owner], 0, g->previous_score[owner], 0, 512u * 4u)))
+        return false;
+    if ((pos + 1u) % ratio) return true;
+    if (level == 2) return ds41_norm(g->latent, ratio == 2 ? g->latent : g->pool_kv, m,
+                                     l->attn_compressor_norm);
+    const uint32_t row = (pos + 1u) / ratio - 1u, rope_pos = pos + 1u - ratio;
+    if (level == 3) return ds41_matmul(g->index_k, m, l->indexer_attn_k, g->latent, false) &&
+        ds4_gpu_tensor_copy(g->compressed[owner], (uint64_t)row * 512u * 4u, g->latent, 0, 512u * 4u);
+    ds4_gpu_tensor *index = ds4_gpu_tensor_view(g->index_cache[owner], (uint64_t)row * 128u * 4u, 128u * 4u);
+    ds4_gpu_tensor *latent = ds4_gpu_tensor_view(g->compressed[owner], (uint64_t)row * 512u * 4u, 512u * 4u);
+    bool ok = index && latent;
+    if (level == 4) ok = ok && ds41_norm(index, g->index_k, m, l->indexer_k_norm) &&
+        ds41_rope(latent, 1, 512, il, rope_pos, false);
+    if (level == 5) ok = ok && ds41_rope(index, 1, DS4_N_INDEXER_HEAD_DIM, il, rope_pos, false) &&
+        ds4_gpu_dsv41_quantize(latent, 512, 1, DS4_V41_FP4_E4M3);
+    if (level == 6) ok = ok && ds4_gpu_dsv41_quantize(index, 128, 1, DS4_V41_FP4_E8M0);
+    ds4_gpu_tensor_free(index);
+    ds4_gpu_tensor_free(latent);
+    return ok;
+}
+
+/* The kv chain (through its RoPE and FP8 rounding), the index weights and
+ * the compressor of a KV source read only g->norm, the index q only the final
+ * qr, and the attention HC mix (left out of ds41_graph_before_attention) only
+ * the residual, so all run beside the q chain in concurrent levels. A barrier
+ * waits for every earlier dispatch: each level holds independent kernels, so
+ * multi-kernel helpers are spelled out. The Metal BF16 norms also round their
+ * matmul inputs on load, and the attention and the index scoring round q
+ * and the index q as they rope them. Outside a batch the same order runs
+ * serially. */
 static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l, uint32_t il) {
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool index = ratio && (g->pos + 1u) / ratio && ds41_index_source(il);
+    const bool compress = ds41_kv_source(il) && (g->pos + 1u) % ratio == 0;
     uint64_t q_row;
     ds4_tensor q_b = *l->attn_q_b;
     if (!tensor_nbytes(q_b.type, q_b.dim[0], &q_row)) return false;
@@ -41614,19 +41788,23 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
     bool ok = ds41_matmul(g->qr, m, l->attn_q_a, g->norm, false) &&
         ds41_matmul(g->kv, m, l->attn_kv, g->norm, false) &&
         ds41_hc_mix_stage(g, m, l, false, 0) &&
-        (!index || ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, false));
+        (!index || ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, false)) &&
+        ds41_attention_publish_level(g, m, l, il, 0);
     ds4_gpu_concurrent_barrier();
     ok = ok && ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
         ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm) && ds41_hc_mix_stage(g, m, l, false, 1) &&
-        (!index || ds41_bf16(g->index_weights, (uint32_t)l->indexer_proj->dim[1]));
+        (!index || ds41_bf16(g->index_weights, (uint32_t)l->indexer_proj->dim[1])) &&
+        ds41_attention_publish_level(g, m, l, il, 1);
     ds4_gpu_concurrent_barrier();
     ok = ok && ds41_matmul(g->q, m, &q_b, g->qr, false) &&
-        ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, g->pos, false) &&
-        (!index || ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, false));
-    ds4_gpu_concurrent_barrier();
-    ok = ok && ds41_bf16(g->q, q_dim) &&
-        ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) &&
-        (!index || ds41_bf16(g->index_q, (uint32_t)l->indexer_attn_q_b->dim[1]));
+        ds4_gpu_dsv41_rope_quantize(g->kv, DS4_N_HEAD_DIM, 1, g->pos, ratio != 0,
+                                    DS4_V41_FP8_E8M0) &&
+        (!index || ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, false)) &&
+        ds41_attention_publish_level(g, m, l, il, 2);
+    for (int level = 3; compress && level < 7; level++) {
+        ds4_gpu_concurrent_barrier();
+        ok = ok && ds41_attention_publish_level(g, m, l, il, level);
+    }
     if (levels) ds4_gpu_concurrent_end();
     return ok;
 }
@@ -41651,10 +41829,9 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
 #ifdef __APPLE__
-    /* The KV publish and index scoring run first; the attention and its
-     * reduce form one concurrent section. */
-    if (!ds41_attention_project(g, m, l, il) || !ds41_attention_publish(g, m, l, il) ||
-        !ds41_attention_score(g, il)) return false;
+    /* The projections publish the compressed KV, and the index scoring runs
+     * next; the attention and its reduce form one concurrent section. */
+    if (!ds41_attention_project(g, m, l, il) || !ds41_attention_score(g, il)) return false;
     const bool levels = ds4_gpu_concurrent_begin() != 0;
 #else
     if ((!projected && !ds41_attention_project(g, m, l)) ||
@@ -41735,7 +41912,14 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
+#ifdef __APPLE__
+    if (!(g->router_bf16[il] ?
+          ds4_gpu_dsv41_router_bf16(g->route_logits, g->router_bf16[il], g->norm,
+                                    DS4_N_EMBD, DS4_N_EXPERT) :
+          ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false)) ||
+#else
     if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
+#endif
         !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
@@ -41869,7 +42053,15 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        if (!ds41_matmul(g->engram_kv, m, l->engram_kv, i ? g->engram_rows_late : g->engram_rows, true) ||
+        const ds4_gpu_tensor *rows = i ? g->engram_rows_late : g->engram_rows;
+#ifdef __APPLE__
+        if (!(g->engram_fp8[i] ?
+              ds4_gpu_dsv41_engram_kv_fp8(g->engram_kv, g->engram_fp8[i], g->engram_fp8_scale[i], rows,
+                                          (uint32_t)l->engram_kv->dim[0], (uint32_t)l->engram_kv->dim[1]) :
+              ds41_matmul(g->engram_kv, m, l->engram_kv, rows, true)) ||
+#else
+        if (!ds41_matmul(g->engram_kv, m, l->engram_kv, rows, true) ||
+#endif
             !ds4_gpu_dsv41_engram_add(g->residual, g->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return false;

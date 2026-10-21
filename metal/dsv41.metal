@@ -105,8 +105,9 @@ struct ds4_metal_args_dsv41_flash_attn {
 // without its F16 staging copies. Eight heads share each chunk staged in
 // threadgroup memory; the partials feed kernel_dsv41_flash_attn_reduce_rope.
 // Only the splits that hold keys run.
-// It also applies kernel_dsv41_rope to q as it loads it, and stores the new
-// KV row in its window slot while reading that row from kv.
+// It also rounds q to BF16 and applies kernel_dsv41_rope to it as it loads
+// it, and stores the new KV row in its window slot while reading that row
+// from kv.
 kernel void kernel_dsv41_flash_attn_decode(
         constant ds4_metal_args_dsv41_flash_attn &args,
         device const float *q,
@@ -136,7 +137,7 @@ kernel void kernel_dsv41_flash_attn_decode(
     half4 sq4[4];
     float4 so4[4];
     FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
-        float4 x = q4[ii * 32 + tiisg];
+        float4 x = dsv41_bf16(q4[ii * 32 + tiisg]);
         if (ii == 3 && tiisg >= 16) {
             FOR_UNROLL (short p = 0; p < 2; ++p) {
                 const float theta = float(rope.start) * rope.frequencies[2 * (tiisg - 16) + p];
@@ -250,6 +251,23 @@ kernel void kernel_dsv41_flash_attn_decode(
 }
 
 
+/* One lane of a quantization block: the block's simdgroup lanes hold the
+ * BF16-rounded values (zero past the block). */
+static inline float dsv41_quantize_lane(float value, uint mode) {
+    const float amax = simd_max(abs(value));
+    float result = value;
+    if (mode == 1u) {
+        const float scale = dsv41_pow2_ceil(max(amax, 1.0e-4f) * (1.0f / 448.0f));
+        result = copysign(dsv4_e4m3fn_dequant(abs(value) / scale), value) * scale;
+    } else if (mode == 2u || mode == 3u) {
+        const float scale = mode == 3u
+            ? dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
+            : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
+        result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+    }
+    return dsv41_bf16(result);
+}
+
 kernel void kernel_dsv41_quantize(
         constant ds4_metal_args_dsv41_quantize &args,
         device float *x,
@@ -259,19 +277,29 @@ kernel void kernel_dsv41_quantize(
     const uint column = group.x * block + lane;
     const bool valid = lane < block && column < args.width;
     const ulong index = (ulong)group.y * args.width + column;
-    const float value = valid ? dsv41_bf16(x[index]) : 0.0f;
-    const float amax = simd_max(abs(value));
-    float result = value;
-    if (args.mode == 1u) {
-        const float scale = dsv41_pow2_ceil(max(amax, 1.0e-4f) * (1.0f / 448.0f));
-        result = copysign(dsv4_e4m3fn_dequant(abs(value) / scale), value) * scale;
-    } else if (args.mode == 2u || args.mode == 3u) {
-        const float scale = args.mode == 3u
-            ? dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
-            : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
-        result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+    const float result = dsv41_quantize_lane(valid ? dsv41_bf16(x[index]) : 0.0f, args.mode);
+    if (valid) x[index] = result;
+}
+
+// kernel_dsv41_bf16_linear, kernel_dsv41_rope and kernel_dsv41_quantize
+// (32-wide blocks) in turn on one head row per threadgroup of width threads:
+// the RoPE tail pairs adjacent lanes.
+kernel void kernel_dsv41_rope_quantize(
+        constant ds4_metal_args_dsv41_rope &args,
+        constant uint &mode,
+        device float *x,
+        uint head [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const ulong i = (ulong)head * args.width + tid;
+    float value = dsv41_bf16(x[i]);
+    const float other = simd_shuffle_xor(value, 1u);
+    const uint tail = args.width - 64u;
+    if (tid >= tail) {
+        const float theta = float(args.start) * args.frequencies[(tid - tail) / 2u];
+        value = tid & 1u ? dsv41_rope_pair(other, value, theta, args.inverse).y
+                         : dsv41_rope_pair(value, other, theta, args.inverse).x;
     }
-    if (valid) x[index] = dsv41_bf16(result);
+    x[i] = dsv41_quantize_lane(dsv41_bf16(value), mode);
 }
 
 struct ds4_metal_args_dsv41_engram {
@@ -641,4 +669,70 @@ kernel void kernel_dsv41_router_select_one(
             weights[tiisg] = ((device volatile float *)weights)[tiisg] * scale;
         }
     }
+}
+
+// V4.1 Engram KV projection from the load-time FP8 repack of its F16 weight:
+// e4m3 bytes, row-major, and one power-of-two float scale per 32x32 block.
+// Each weight decodes to exactly its F16 value; the K walk and reduction
+// tree replicate kernel_mul_mv_f16_f32_4 (nsg=8, nr0=2), then BF16 rounding.
+kernel void kernel_dsv41_engram_kv_fp8(
+        constant uint2 &dims,
+        device const uchar * src0,
+        device const float * scales,
+        device const float4 * y4,
+        device       float * dst,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NSG = 8;
+    constexpr short NR0 = 2;
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const int nb = dims.x/NB;
+    const int r0 = tgpig.x*NR0;
+
+    device const uint4 * ax[NR0];
+    device const float * as[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const uint4 *) (src0 + (uint64_t)(r0 + row)*dims.x);
+        as[row] = scales + (uint64_t)((r0 + row)/32)*nb;
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+    const int ib0 = sgitg*NF + ix;
+
+    device const float4 * yb4 = y4 + (ib0*NB + il*NF)/4;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        float4 yl4[NF4];
+        for (short i = 0; i < NF4; ++i) {
+            yl4[i] = yb4[i];
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            const uint4 q = ax[row][(ib*NB + il*NF)/16];
+            const float s = as[row][ib];
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                /* e4m3 into the top bits of a half: the value times 2^-8. */
+                const ushort4 b = ushort4(as_type<uchar4>(q[i]));
+                const float4 x = float4(as_type<half4>(((b & 0x7fu) << 7) | ((b & 0x80u) << 8)));
+                sumq += dot(x*s, yl4[i]);
+            }
+
+            sumf[row] += sumq;
+        }
+
+        yb4 += NSG*NF*NW/4;
+    }
+
+    helper_mv_reduce_and_write<NR0, true>(dst, sumf, r0, dims.y, tiisg, sgitg, shmem);
 }
