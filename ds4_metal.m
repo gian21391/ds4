@@ -44810,6 +44810,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                ds4_gpu_tensor_offset(mid));
         }
         DS4_METAL_PROFILE_MOE_STAGE("activation_weight");
+        /* A caller's concurrent section ends the activation level here. */
+        ds4_gpu_concurrent_barrier();
 
         id<MTLBuffer> down_dst = n_expert == 1 ? outbuf : (expertsbuf ? expertsbuf : g_moe_down_scratch_buffer);
         NSUInteger down_dst_off = n_expert == 1 ? ds4_gpu_tensor_offset(out) :
@@ -46497,8 +46499,8 @@ int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
 
 int ds4_gpu_dsv41_hc_expand_add(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
         const ds4_gpu_tensor *add, const ds4_gpu_tensor *residual,
-        const ds4_gpu_tensor *split, uint32_t width) {
-    return out && ds4_gpu_tensor_bytes(out) == (uint64_t)width * 4u * sizeof(float) &&
+        const ds4_gpu_tensor *split, uint32_t width, uint32_t rows) {
+    return out && ds4_gpu_tensor_bytes(out) == (uint64_t)width * 4u * rows * sizeof(float) &&
         ds4_gpu_hc_expand_split(out, block, add, residual, split, width, 4, true);
 }
 
