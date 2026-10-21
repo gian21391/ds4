@@ -41277,7 +41277,7 @@ static bool ds41_matmul_rows_batch(ds4_gpu_tensor *out, const ds4_model *m,
     return ds41_matmul_batch(out, m, &slice, in, rows, true);
 }
 
-static bool ds41_matmul_rows(ds4_gpu_tensor *out, const ds4_model *m,
+static DS4_MAYBE_UNUSED bool ds41_matmul_rows(ds4_gpu_tensor *out, const ds4_model *m,
                              const ds4_tensor *weight, const ds4_gpu_tensor *in,
                              uint32_t first, uint32_t count) {
     return ds41_matmul_rows_batch(out, m, weight, in, first, count, 1);
@@ -41413,18 +41413,25 @@ static bool ds41_rope(ds4_gpu_tensor *x, uint32_t heads, uint32_t width,
                               ds4_layer_compress_ratio(il) != 0, inverse);
 }
 
-static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
-                        const ds4_layer_weights *l, bool ffn) {
-    const ds4_gpu_tensor *residual = ffn ? g->after_attn : g->residual;
-    const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
+/* One of the HC mix's three dependent kernels, so Metal can run them
+ * beside other work. */
+static bool ds41_hc_mix_stage(ds41_gpu_graph *g, const ds4_model *m,
+                              const ds4_layer_weights *l, bool ffn, int stage) {
     const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
     const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
-    return ds4_gpu_rms_norm_plain_tensor(g->flat_norm, residual,
-               DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS) &&
-           ds41_matmul(g->mix, m, fn, g->flat_norm, false) &&
-           ds4_gpu_hc_split_sinkhorn_tensor(ffn ? g->ffn_split : g->attn_split,
+    if (stage == 0)
+        return ds4_gpu_rms_norm_plain_tensor(g->flat_norm, ffn ? g->after_attn : g->residual,
+                                             DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS);
+    if (stage == 1) return ds41_matmul(g->mix, m, ffn ? l->hc_ffn_fn : l->hc_attn_fn, g->flat_norm, false);
+    return ds4_gpu_hc_split_sinkhorn_tensor(ffn ? g->ffn_split : g->attn_split,
                g->mix, m->map, m->size, scale->abs_offset, base->abs_offset,
                DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
+}
+
+static DS4_MAYBE_UNUSED bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
+                                         const ds4_layer_weights *l, bool ffn) {
+    return ds41_hc_mix_stage(g, m, l, ffn, 0) && ds41_hc_mix_stage(g, m, l, ffn, 1) &&
+           ds41_hc_mix_stage(g, m, l, ffn, 2);
 }
 
 static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
@@ -41536,6 +41543,47 @@ static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
         ds41_attention_select_published(g, m, l, il);
 }
 
+#ifdef __APPLE__
+/* The kv chain (through its RoPE and FP8 rounding) reads only g->norm and
+ * the attention HC mix (left out of ds41_graph_before_attention) only the
+ * residual, so both run beside the q chain in concurrent levels. A barrier
+ * waits for every earlier dispatch: each level holds independent kernels, so
+ * multi-kernel helpers are spelled out. Outside a batch the same order runs
+ * serially. */
+static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
+                                    const ds4_layer_weights *l, uint32_t il) {
+    const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+    uint64_t q_row;
+    ds4_tensor q_b = *l->attn_q_b;
+    if (!tensor_nbytes(q_b.type, q_b.dim[0], &q_row)) return false;
+    q_b.abs_offset += (uint64_t)g->tp_rank * q_dim * q_row;
+    q_b.dim[1] = q_dim;
+    const bool levels = ds4_gpu_concurrent_begin() != 0;
+    bool ok = ds41_matmul(g->qr, m, l->attn_q_a, g->norm, false) &&
+        ds41_matmul(g->kv, m, l->attn_kv, g->norm, false) &&
+        ds41_hc_mix_stage(g, m, l, false, 0);
+    ds4_gpu_concurrent_barrier();
+    ok = ok && ds41_bf16(g->qr, (uint32_t)l->attn_q_a->dim[1]) &&
+        ds41_bf16(g->kv, (uint32_t)l->attn_kv->dim[1]) && ds41_hc_mix_stage(g, m, l, false, 1);
+    ds4_gpu_concurrent_barrier();
+    ok = ok && ds4_gpu_rms_norm_weight_tensor(g->qr, g->qr, m->map, m->size,
+            l->attn_q_a_norm->abs_offset, (uint32_t)l->attn_q_a_norm->dim[0], DS4_RMS_EPS) &&
+        ds4_gpu_rms_norm_weight_tensor(g->kv, g->kv, m->map, m->size,
+            l->attn_kv_a_norm->abs_offset, (uint32_t)l->attn_kv_a_norm->dim[0], DS4_RMS_EPS) &&
+        ds41_hc_mix_stage(g, m, l, false, 2);
+    ds4_gpu_concurrent_barrier();
+    ok = ok && ds41_bf16(g->qr, (uint32_t)l->attn_q_a_norm->dim[0]) &&
+        ds41_bf16(g->kv, (uint32_t)l->attn_kv_a_norm->dim[0]);
+    ds4_gpu_concurrent_barrier();
+    ok = ok && ds41_matmul(g->q, m, &q_b, g->qr, false) &&
+        ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, g->pos, false);
+    ds4_gpu_concurrent_barrier();
+    ok = ok && ds41_bf16(g->q, q_dim) &&
+        ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0);
+    if (levels) ds4_gpu_concurrent_end();
+    return ok;
+}
+#else
 static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l) {
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
@@ -41546,6 +41594,7 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
         ds41_matmul(g->kv, m, l->attn_kv, g->norm, true) &&
         ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
 }
+#endif
 
 static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, bool projected) {
@@ -41554,10 +41603,15 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
+#ifdef __APPLE__
+    if (!ds41_attention_project(g, m, l, il) ||
+        !ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
+#else
     if (!projected && !ds41_attention_project(g, m, l)) return false;
     if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
+#endif
         !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
                              g->kv, 0, 512u * 4u) ||
         !ds41_attention_select(g, m, l, il)) return false;
@@ -41735,15 +41789,34 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
             return false;
     }
     return ds41_dspark_capture(g->dspark, il, g->pos, g->residual, 1) &&
+#ifndef __APPLE__
         ds41_hc_mix(g, m, l, false) &&
+#endif
         ds41_hc_sum(g->x, g->residual, g->pre, false) && ds41_norm(g->norm, g->x, m, l->attn_norm);
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
+#ifdef __APPLE__
+    /* The FFN HC mix feeds only the post-FFN expand: run it beside the FFN
+     * input sum and norm, as in ds41_attention_project. */
+    if (!ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split)) return false;
+    const bool levels = ds4_gpu_concurrent_begin() != 0;
+    bool ok = ds41_hc_mix_stage(g, m, l, true, 0) &&
+        ds4_gpu_hc_weighted_sum_split_tensor(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC);
+    ds4_gpu_concurrent_barrier();
+    ok = ok && ds41_hc_mix_stage(g, m, l, true, 1) && ds41_bf16(g->x, DS4_N_EMBD);
+    ds4_gpu_concurrent_barrier();
+    ok = ok && ds41_hc_mix_stage(g, m, l, true, 2) &&
+        ds4_gpu_rms_norm_weight_tensor(g->norm, g->x, m->map, m->size,
+            l->ffn_norm->abs_offset, (uint32_t)l->ffn_norm->dim[0], DS4_RMS_EPS);
+    if (levels) ds4_gpu_concurrent_end();
+    return ok && ds41_bf16(g->norm, (uint32_t)l->ffn_norm->dim[0]);
+#else
     return ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split) &&
         ds41_hc_mix(g, m, l, true) &&
         ds41_hc_sum(g->x, g->after_attn, g->attn_split, true) && ds41_norm(g->norm, g->x, m, l->ffn_norm);
+#endif
 }
 
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,

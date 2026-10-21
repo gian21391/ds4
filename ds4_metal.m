@@ -9359,6 +9359,23 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     if (bytes == 0) return 1;
     if (!g_batch_cb) return 0;
 
+    /* A small aligned copy stays in the serial compute encoder, which orders
+     * it like the blit without ending the encoder. */
+    if (!g_batch_encoder_concurrent && bytes <= (1u << 20) &&
+        ((s.offset + src_offset) | (d.offset + dst_offset) | bytes) % 4u == 0) {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_copy_u32");
+        if (!pipeline) return 0;
+        const uint32_t n = (uint32_t)(bytes / 4u);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&n length:sizeof(n) atIndex:0];
+        [enc setBuffer:s.buffer offset:(NSUInteger)(s.offset + src_offset) atIndex:1];
+        [enc setBuffer:d.buffer offset:(NSUInteger)(d.offset + dst_offset) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((n + 255u) / 256u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        return 1;
+    }
+
     /* C inference callers have no surrounding autorelease pool. In particular,
      * validation-layer blit bookkeeping otherwise accumulates across tokens. */
     @autoreleasepool {
@@ -9507,6 +9524,23 @@ int ds4_gpu_flush_encoder(void) {
     if (!g_batch_cb) return 0;
     ds4_gpu_close_batch_encoder();
     return 1;
+}
+
+int ds4_gpu_concurrent_begin(void) {
+    if (!g_batch_cb || g_batch_encoder_concurrent) return 0;
+    ds4_gpu_close_batch_encoder();
+    g_batch_encoder_concurrent = YES;
+    return 1;
+}
+
+void ds4_gpu_concurrent_barrier(void) {
+    if (g_batch_encoder_concurrent && g_batch_enc)
+        [g_batch_enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+void ds4_gpu_concurrent_end(void) {
+    ds4_gpu_close_batch_encoder();
+    g_batch_encoder_concurrent = NO;
 }
 
 int ds4_gpu_flush_commands(void) {

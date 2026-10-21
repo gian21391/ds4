@@ -164,6 +164,13 @@ int ds4_gpu_kv_norm_task_pending(void);
 int ds4_gpu_kv_norm_task_flush(void);
 int ds4_gpu_kv_norm_task_begin_concurrent(void);
 void ds4_gpu_kv_norm_task_end_concurrent(void);
+/* Concurrent section of the open command batch: dispatches may overlap
+ * except across a barrier, which waits for everything encoded before it.
+ * Begin returns 0 when no batch is open or a section already is; end only
+ * a section this caller began. */
+int ds4_gpu_concurrent_begin(void);
+void ds4_gpu_concurrent_barrier(void);
+void ds4_gpu_concurrent_end(void);
 #endif
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
