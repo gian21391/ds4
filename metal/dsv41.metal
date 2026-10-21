@@ -289,6 +289,8 @@ kernel void kernel_dsv41_indexer_scores_packed(
 // the biased top-6 and the normalized expert weights in one dispatch of 512
 // threads. Each step repeats the unary, bin, argsort, get_rows and sum_rows
 // kernels of the generic path, so the selection and weights stay identical.
+// Each thread carries one sort element; compare-exchanges within a SIMD group
+// use shuffles, the wider ones go through double-buffered threadgroup memory.
 kernel void kernel_dsv41_router_select_one(
         constant float &scale,
         device const float *logits,
@@ -296,13 +298,15 @@ kernel void kernel_dsv41_router_select_one(
         device const float *bias,
         device int32_t *selected,
         device float *weights,
-        threadgroup int32_t *idx [[threadgroup(0)]],
+        threadgroup float *scratch [[threadgroup(0)]],
         uint tid [[thread_position_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr int n = 384;
-    threadgroup float *score = (threadgroup float *)(idx + 512);
-    threadgroup float *prob = score + 512;
+    threadgroup float *prob = scratch;
+    threadgroup float *score_tg[2] = {scratch + 512, scratch + 1024};
+    threadgroup int32_t *idx_tg[2] = {(threadgroup int32_t *)(scratch + 1536),
+                                      (threadgroup int32_t *)(scratch + 2048)};
     if (tid < n / 4) {
         const float4 x = ((device const float4 *)logits)[tid];
         const float4 ex = exp(x);
@@ -311,31 +315,44 @@ kernel void kernel_dsv41_router_select_one(
         const float4 p = sqrt(select(select(log(1 + ex), poly, ex < 0.03125f), x, x > 20));
         ((device float4 *)probs)[tid] = p;
         ((threadgroup float4 *)prob)[tid] = p;
-        ((threadgroup float4 *)score)[tid] = p + ((device const float4 *)bias)[tid];
+        ((threadgroup float4 *)score_tg[0])[tid] = p + ((device const float4 *)bias)[tid];
     }
-    idx[tid] = (int32_t)tid;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    float score = score_tg[0][tid];
+    int32_t idx = (int32_t)tid;
+    uint stage = 1;
     for (uint k = 2; k <= 512; k <<= 1) {
         for (uint j = k >> 1; j > 0; j >>= 1) {
-            const uint other = tid ^ j;
-            if (other > tid) {
-                const int a = idx[tid], b = idx[other];
-                const bool swap = (tid & k) == 0 ?
-                    a >= n || (b < n && score[a] < score[b]) :
-                    b >= n || (a < n && score[a] > score[b]);
-                if (swap) {
-                    idx[tid] = b;
-                    idx[other] = a;
-                }
+            float peer_score;
+            int32_t peer_idx;
+            if (j < 32) {
+                peer_score = simd_shuffle_xor(score, (ushort)j);
+                peer_idx = simd_shuffle_xor(idx, (ushort)j);
+            } else {
+                score_tg[stage & 1][tid] = score;
+                idx_tg[stage & 1][tid] = idx;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                peer_score = score_tg[stage & 1][tid ^ j];
+                peer_idx = idx_tg[stage & 1][tid ^ j];
+                stage++;
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const bool lower = (tid & j) == 0;
+            const int a = lower ? idx : peer_idx, b = lower ? peer_idx : idx;
+            const float sa = lower ? score : peer_score, sb = lower ? peer_score : score;
+            const bool swap = (tid & k) == 0 ?
+                a >= n || (b < n && sa < sb) :
+                b >= n || (a < n && sa > sb);
+            if (swap) {
+                score = peer_score;
+                idx = peer_idx;
+            }
         }
     }
     if (sgitg == 0) {
-        const float w = tiisg < 6 ? prob[idx[tiisg]] : 0.0f;
+        const float w = tiisg < 6 ? prob[idx] : 0.0f;
         const float sum = max(simd_sum(w), 6.103515625e-5f);
         if (tiisg < 6) {
-            selected[tiisg] = idx[tiisg];
+            selected[tiisg] = idx;
             /* Round the quotient before scaling, as the separate div and
              * scale kernels do. */
             weights[tiisg] = w / sum;

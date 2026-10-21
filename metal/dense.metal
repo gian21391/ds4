@@ -470,6 +470,13 @@ static inline float dsv41_bf16(float x) {
     return as_type<float>(bits & 0xffff0000u);
 }
 
+static inline float4 dsv41_bf16(float4 x) {
+    uint4 bits = as_type<uint4>(x);
+    bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u),
+                   (bits & 0x7f800000u) != 0x7f800000u);
+    return as_type<float4>(bits & 0xffff0000u);
+}
+
 // Decode shared-expert gate/up projections followed by SwiGLU:
 //
 //     mid = silu(min(gate, limit)) * clamp(up, -limit, limit)

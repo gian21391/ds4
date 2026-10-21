@@ -23,9 +23,10 @@ typedef enum {
 } ds4_v41_activation_format;
 int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
                           ds4_v41_activation_format format);
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /* Same reductions as the ordinary kernels, with the required BF16 store
- * folded into the operation. hc_sum reads either 4- or 24-float row weights. */
+ * folded into the operation. hc_sum reads either 4- or 24-float row weights.
+ * Metal also rounds the norm input and the expand block on load. */
 int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t offset,
         uint32_t width, uint32_t rows, float eps);

@@ -5403,15 +5403,15 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     };
 }
 
-/* Single-token F16/F32 matvecs with few output rows (the Qwen hyper-connection
- * low-rank down projections and routers) launch one row per SIMD group on M5,
- * where two-row tiles leave most of the 40 cores idle.  The per-row K walk,
+/* Single-token F16/F32 matvecs with few output rows (hyper-connection mixes,
+ * low-rank down projections and routers) launch one row per threadgroup,
+ * where two-row tiles leave most of the GPU cores idle.  The per-row K walk,
  * simdgroup count and reduction tree are unchanged.  DS4_METAL_PLAIN_MV_NR0
- * forces 1 or 2 rows on any device. */
+ * forces 1 or 2 rows. */
 static bool ds4_gpu_plain_mv_single_row(uint64_t out_dim) {
     const uint64_t override = ds4_gpu_env_u64("DS4_METAL_PLAIN_MV_NR0", 0u, 0u, 2u);
     if (override) return override == 1u;
-    return out_dim <= 1024u && ds4_gpu_device_is_m5_apple_silicon();
+    return out_dim <= 1024u;
 }
 
 static ds4_gpu_mv_dispatch ds4_gpu_make_plain_mv_dispatch(
@@ -5672,6 +5672,7 @@ typedef struct {
     uint64_t nb_w1;
     uint64_t nb0;
     uint64_t nb1;
+    int32_t bf16;
 } ds4_gpu_hc_weighted_sum_args;
 
 typedef struct {
@@ -5733,6 +5734,7 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     int32_t has_add;
+    int32_t bf16;
 } ds4_gpu_hc_expand_args;
 
 typedef struct {
@@ -9359,9 +9361,10 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     if (bytes == 0) return 1;
     if (!g_batch_cb) return 0;
 
-    /* A small aligned copy stays in the serial compute encoder, which orders
-     * it like the blit without ending the encoder. */
-    if (!g_batch_encoder_concurrent && bytes <= (1u << 20) &&
+    /* A small aligned copy stays in the compute encoder, which orders it like
+     * the blit without ending the encoder; inside a concurrent section the
+     * caller orders it with barriers. */
+    if (bytes <= (1u << 20) &&
         ((s.offset + src_offset) | (d.offset + dst_offset) | bytes) % 4u == 0) {
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_copy_u32");
         if (!pipeline) return 0;
@@ -22360,7 +22363,7 @@ int ds4_gpu_rms_norm_weight_tensor(
     return ds4_gpu_rms_norm_weight_rows_tensor(out, x, model_map, model_size, weight_offset, n, 1, eps);
 }
 
-int ds4_gpu_rms_norm_weight_rows_tensor(
+static int ds4_gpu_rms_norm_weight_rows(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
         const void             *model_map,
@@ -22368,7 +22371,8 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint64_t                weight_offset,
         uint32_t                n,
         uint32_t                rows,
-        float                   eps) {
+        float                   eps,
+        bool                    bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (n == 0 || rows == 0 || (n & 3u) != 0) return 0;
 
@@ -22396,13 +22400,16 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
                                                        &inner_offset);
         if (!wbuf) return 0;
 
+        id<MTLComputePipelineState> pipeline = bf16 ?
+            ds4_gpu_get_pipeline("kernel_dsv41_rms_norm_mul_bf16_f32_4") : g_rms_norm_pipeline;
+        if (!pipeline) return 0;
         ds4_gpu_rms_norm_args args = ds4_gpu_make_rms_norm_args(n, rows, eps);
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_rms_norm_pipeline];
+        [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:2];
@@ -22417,6 +22424,25 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_rms_norm_weight_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps) {
+    return ds4_gpu_rms_norm_weight_rows(out, x, model_map, model_size, weight_offset, n, rows, eps, false);
+}
+
+/* Unlike CUDA, x is also rounded on load, so it may be unrounded. */
+int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t offset,
+        uint32_t width, uint32_t rows, float eps) {
+    return ds4_gpu_rms_norm_weight_rows(out, x, map, size, offset, width, rows, eps, true);
 }
 
 int ds4_gpu_add_rms_norm_weight_tensor(
@@ -27901,6 +27927,8 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
                                               0)) {
         return 0;
     }
+    /* Inside a concurrent section each dependent step waits on the last. */
+    ds4_gpu_concurrent_barrier();
 
     if ((n_raw % ncpsg) != 0) {
         ds4_gpu_flash_attn_pad_args pad_args = {
@@ -27931,6 +27959,7 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
         [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
+        ds4_gpu_concurrent_barrier();
     }
 
     ds4_gpu_flash_attn_vec_args vec_args = {
@@ -27987,6 +28016,7 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
     [enc dispatchThreadgroups:MTLSizeMake(1, n_head, nwg)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
+    ds4_gpu_concurrent_barrier();
 
     ds4_gpu_flash_attn_reduce_args reduce_args = {
         .nrows = (int32_t)nrows,
@@ -29559,6 +29589,8 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         !ds4_gpu_encode_fill_f16_1d(cb, flash_mask_buffer, 0, n_keys, 0.0f)) {
         return 0;
     }
+    /* Inside a concurrent section each dependent step waits on the last. */
+    if (!use_persistent_zero_mask) ds4_gpu_concurrent_barrier();
     if (use_mask && n_comp &&
         !ds4_gpu_encode_cpy_f32_f16_1d(cb,
                                          maskbuf,
@@ -29593,6 +29625,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
             &pad_fused)) {
         return 0;
     }
+    ds4_gpu_concurrent_barrier();
 
     id<MTLComputePipelineState> pad_pipeline = nil;
     if (has_kvpad && !pad_fused) {
@@ -29629,6 +29662,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
+        ds4_gpu_concurrent_barrier();
     }
 
     ds4_gpu_flash_attn_vec_args vec_args = {
@@ -29708,6 +29742,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     [enc dispatchThreadgroups:MTLSizeMake(1, n_head, nwg)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
+    ds4_gpu_concurrent_barrier();
 
     ds4_gpu_flash_attn_reduce_args reduce_args = {
         .nrows = (int32_t)nrows,
@@ -34184,7 +34219,7 @@ static int ds4_gpu_encode_router_select(
         [enc setBuffer:biasbuf offset:bias_off atIndex:3];
         [enc setBuffer:selectedbuf offset:selected_off atIndex:4];
         [enc setBuffer:weightsbuf offset:weights_off atIndex:5];
-        [enc setThreadgroupMemoryLength:(2u * 512u + 384u) * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:5u * 512u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -44673,7 +44708,8 @@ static int ds4_gpu_hc_weighted_sum_strided(
         uint64_t                weight_row_stride,
         uint32_t                n_embd,
         uint32_t                n_hc,
-        const char             *label) {
+        const char             *label,
+        bool                    bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0 ||
         weight_row_stride < (uint64_t)n_hc * sizeof(float)) {
@@ -44728,6 +44764,7 @@ static int ds4_gpu_hc_weighted_sum_strided(
             .nb_w1 = weight_row_stride,
             .nb0 = sizeof(float),
             .nb1 = (uint64_t)n_embd * sizeof(float),
+            .bf16 = bf16,
         };
         const uint64_t n_elem = (uint64_t)n_embd * n_tokens64;
         const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
@@ -44765,7 +44802,8 @@ int ds4_gpu_hc_weighted_sum_tensor(
                                              (uint64_t)n_hc * sizeof(float),
                                              n_embd,
                                              n_hc,
-                                             "HC weighted sum");
+                                             "HC weighted sum",
+                                             false);
 }
 
 int ds4_gpu_hc_weighted_sum_split_tensor(
@@ -44782,7 +44820,17 @@ int ds4_gpu_hc_weighted_sum_split_tensor(
                                              mix_hc * sizeof(float),
                                              n_embd,
                                              n_hc,
-                                             "HC weighted sum split");
+                                             "HC weighted sum split",
+                                             false);
+}
+
+/* The output holds exactly the rows, as the HC helpers derive them from it. */
+int ds4_gpu_dsv41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *weights, uint32_t width, uint32_t rows,
+        uint32_t weight_stride) {
+    return out && ds4_gpu_tensor_bytes(out) == (uint64_t)width * rows * sizeof(float) &&
+        ds4_gpu_hc_weighted_sum_strided(out, x, weights, 0,
+            (uint64_t)weight_stride * sizeof(float), width, 4, "V4.1 BF16 HC sum", true);
 }
 
 /* Release decode fused HC pre-sublayer operation.  The graph driver owns the
@@ -45954,13 +46002,14 @@ int ds4_gpu_hc_expand_add_tensor(
     return 1;
 }
 
-int ds4_gpu_hc_expand_split_tensor(
+static int ds4_gpu_hc_expand_split(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) {
+        uint32_t                n_hc,
+        bool                    bf16) {
     if (!g_initialized && !ds4_gpu_init()) {
         fprintf(stderr, "ds4: Metal HC expand split could not initialize the backend\n");
         return 0;
@@ -46032,6 +46081,7 @@ int ds4_gpu_hc_expand_split_tensor(
             .nb1 = (uint64_t)n_embd * sizeof(float),
             .nb2 = (uint64_t)n_hc * n_embd * sizeof(float),
             .has_add = 0,
+            .bf16 = bf16,
         };
         id<MTLComputePipelineState> expand_pipeline = g_hc_expand_pipeline;
         uint64_t n_elem = (uint64_t)n_embd * n_hc * n_tokens64;
@@ -46070,6 +46120,24 @@ int ds4_gpu_hc_expand_split_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_hc_expand_split_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    return ds4_gpu_hc_expand_split(out_hc, block_out, residual_hc, split, n_embd, n_hc, false);
+}
+
+/* Unlike CUDA, the block is also rounded on load, so it may be unrounded. */
+int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
+        uint32_t width, uint32_t rows) {
+    return out && ds4_gpu_tensor_bytes(out) == (uint64_t)width * 4u * rows * sizeof(float) &&
+        ds4_gpu_hc_expand_split(out, block, residual, split, width, 4, true);
 }
 
 int ds4_gpu_hc_expand_split_half_tensor(
