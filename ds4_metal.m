@@ -9696,7 +9696,8 @@ static int ds4_gpu_parallel_ffn_start_range(
         uint32_t              shared_lane_offset,
         uint32_t              shared_lane_count,
         const ds4_gpu_tensor *x,
-        float                 clamp) {
+        float                 clamp,
+        bool                  dsv41) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!g_batch_cb || g_parallel_q8_pending || g_batch_encoder_concurrent ||
         !gate || !up || !mid || !shared_out || !x || !model_map ||
@@ -9751,7 +9752,8 @@ static int ds4_gpu_parallel_ffn_start_range(
     if (!gate_wbuf || !up_wbuf || !down_wbuf) return 0;
 
     ds4_gpu_mv_dispatch gate_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
-    const char *gate_fn = "kernel_dsv4_shared_gate_up_swiglu_q8_0";
+    const char *gate_fn = dsv41 ? "kernel_dsv41_shared_gate_up_swiglu_q8_0" :
+                                  "kernel_dsv4_shared_gate_up_swiglu_q8_0";
     id<MTLComputePipelineState> gate_pipeline =
         ds4_gpu_get_mul_mv_pipeline(gate_fn, gate_dispatch.nsg);
     id<MTLComputePipelineState> down_pipeline =
@@ -9824,7 +9826,7 @@ int ds4_gpu_parallel_ffn_start(
     return ds4_gpu_parallel_ffn_start_range(
         gate, up, mid, shared_out, model_map, model_size,
         gate_offset, up_offset, down_offset, model_dim, shared_dim,
-        0, shared_dim, x, clamp);
+        0, shared_dim, x, clamp, false);
 }
 
 int ds4_gpu_parallel_ffn_start_sliced(
@@ -9846,7 +9848,7 @@ int ds4_gpu_parallel_ffn_start_sliced(
     return ds4_gpu_parallel_ffn_start_range(
         gate, up, mid, shared_out, model_map, model_size,
         gate_offset, up_offset, down_offset, model_dim, shared_dim,
-        shared_lane_offset, shared_lane_count, x, clamp);
+        shared_lane_offset, shared_lane_count, x, clamp, false);
 }
 
 int ds4_gpu_parallel_ffn_start_split(
@@ -10120,6 +10122,40 @@ int ds4_gpu_parallel_ffn_finish(void) {
      * safe and idempotent as an explicit abort. */
     ds4_gpu_parallel_ffn_reset_state(YES);
     return completed;
+}
+
+/* Mirrors the resident IQ2_XXS/Q2_K selection in ds4_gpu_routed_moe_one_tensor
+ * (fuse_pair_swiglu, direct_down_sum) and ds4_gpu_routed_moe_batch_tensor
+ * (use_tiny_pair_swiglu, direct_down_sum through v41_decode_batch).  Any
+ * other route chains dispatches that a concurrent encoder would race. */
+bool ds4_gpu_dsv41_routed_fused(uint32_t gate_type, uint32_t down_type, uint32_t rows) {
+    return gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K &&
+        rows >= 1 && rows <= 8 &&
+        !g_quality_mode && !g_ssd_streaming_mode && !ds4_gpu_tp_world_is_two() &&
+        !getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") &&
+        !getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") &&
+        !getenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION");
+}
+
+/* V4.1 single-device shared expert, run beside the routed experts in the
+ * concurrent FFN encoder.  The caller starts it only where
+ * ds4_gpu_dsv41_routed_fused admits the routed experts. */
+int ds4_gpu_dsv41_shared_start(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t width, uint32_t hidden, float clamp,
+        const ds4_v41_shared_owner *owner) {
+    if (owner) return 0;
+    return ds4_gpu_parallel_ffn_start_range(
+        gate, up, mid, out, model_map, model_size,
+        gate_offset, up_offset, down_offset, width, hidden,
+        0, hidden, x, clamp, true);
+}
+
+int ds4_gpu_dsv41_shared_join(void) {
+    return ds4_gpu_parallel_ffn_finish();
 }
 
 
@@ -40868,11 +40904,7 @@ int ds4_gpu_routed_moe_one_tensor(
                 g_parallel_ffn_mode == 2 &&
                 gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
                 down_type == DS4_METAL_TENSOR_Q2_K &&
-                n_tokens == 1 && n_expert == 6 && n_total_expert == 256 &&
-                expert_in_dim == 4096 && expert_mid_dim == 2048 &&
-                out_dim == 4096 && gate_row_bytes == 1056 &&
-                gate_expert_bytes == 2162688 && down_row_bytes == 672 &&
-                down_expert_bytes == 2752512 &&
+                n_tokens == 1 && n_expert == 6 &&
                 first_expert == 0 && n_bind_expert == n_total_expert &&
                 g_tp_split_rank == 0 && g_tp_split_world == 1 &&
                 add_in == NULL && (force_resident || !g_ssd_streaming_mode) &&

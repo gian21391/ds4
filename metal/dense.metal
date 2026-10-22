@@ -70,6 +70,20 @@ struct ds4_metal_args_mul_mv_ext {
     int16_t r3;
 };
 
+static inline float dsv41_bf16(float x) {
+    uint bits = as_type<uint>(x);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return as_type<float>(bits & 0xffff0000u);
+}
+
+static inline float4 dsv41_bf16(float4 x) {
+    uint4 bits = as_type<uint4>(x);
+    bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u),
+                   (bits & 0x7f800000u) != 0x7f800000u);
+    return as_type<float4>(bits & 0xffff0000u);
+}
+
 template<short NR0>
 static inline void helper_mv_reduce_and_write(
         device float * dst_f32,
@@ -531,7 +545,7 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
 // same lane that owns the reduced output row.  The point is not to fuse two
 // independent weight streams into one matmul; it is to remove the separate
 // activation pass and its reread of the two 2048-wide rows.
-template<short NR0, bool STORE_GATE_UP>
+template<short NR0, bool STORE_GATE_UP, bool BF16 = false>
 void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0_gate,
@@ -642,19 +656,20 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
                 gate_f32[out_row] = gate;
                 up_f32[out_row] = up;
             }
-            float g = gate;
-            float u = up;
+            float g = BF16 ? dsv41_bf16(gate) : gate;
+            float u = BF16 ? dsv41_bf16(up) : up;
             if (clamp_value > 1.0e-6f) {
                 g = min(g, clamp_value);
                 u = clamp(u, -clamp_value, clamp_value);
             }
             const float silu = g / (1.0f + exp(-g));
-            mid_f32[out_row] = silu * u;
+            mid_f32[out_row] = BF16 ? dsv41_bf16(silu * u) : silu * u;
         }
     }
 }
 
-[[host_name("kernel_dsv4_shared_gate_up_swiglu_q8_0")]]
+// V4.1 rounds gate, up and the SwiGLU output to BF16.
+template<bool STORE_GATE_UP, bool BF16>
 kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0_gate,
@@ -668,10 +683,14 @@ kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, true>(
+    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, STORE_GATE_UP, BF16>(
             args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }
+
+typedef decltype(kernel_dsv4_shared_gate_up_swiglu_q8_0<true, false>) kernel_dsv4_shared_gate_up_swiglu_q8_0_t;
+template [[host_name("kernel_dsv4_shared_gate_up_swiglu_q8_0")]]  kernel kernel_dsv4_shared_gate_up_swiglu_q8_0_t kernel_dsv4_shared_gate_up_swiglu_q8_0<true, false>;
+template [[host_name("kernel_dsv41_shared_gate_up_swiglu_q8_0")]] kernel kernel_dsv4_shared_gate_up_swiglu_q8_0_t kernel_dsv4_shared_gate_up_swiglu_q8_0<false, true>;
 
 // Same body as kernel_dsv4_shared_gate_up_swiglu_q8_0_impl with the row
 // bound taken from a thread value instead of args.ne01 (GPU-decided lane

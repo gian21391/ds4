@@ -35,7 +35,16 @@ int ds4_gpu_dsv41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
 int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
         const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
         uint32_t width, uint32_t rows);
-/* CUDA scalar Q8 shared expert. 1: queued; 0: unsupported, no work queued;
+#endif
+#ifdef __APPLE__
+/* Whether the routed experts of rows tokens encode as one fused pair-SwiGLU
+ * dispatch and one direct sum6 dispatch: the only route that may share
+ * concurrent levels with the shared expert. */
+bool ds4_gpu_dsv41_routed_fused(uint32_t gate_type, uint32_t down_type, uint32_t rows);
+#endif
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+/* Q8 shared expert (CUDA: scalar stream; Metal: concurrent with the routed
+ * experts, single device). 1: queued; 0: unsupported, no work queued;
  * -1: failure. After 1, keep the input/output tensors alive and unchanged
  * until join, which orders the result before subsequent main-stream work.
  * Other work may run between start and join using separate tensors.
@@ -53,6 +62,8 @@ int ds4_gpu_dsv41_shared_start(
         uint32_t width, uint32_t hidden, float clamp,
         const ds4_v41_shared_owner *owner);
 int ds4_gpu_dsv41_shared_join(void);
+#endif
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /* Mask a computed short batch before the owned router filter mutates IDs. */
 int ds4_gpu_dsv41_shared_mask(ds4_gpu_tensor *shared, const ds4_gpu_tensor *selected,
         uint32_t width, uint32_t rows, uint32_t experts, uint32_t active,

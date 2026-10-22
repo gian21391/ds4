@@ -6,13 +6,6 @@ struct ds4_metal_args_dsv41_quantize {
     uint mode;
 };
 
-static inline float dsv41_bf16(float x) {
-    uint bits = as_type<uint>(x);
-    if ((bits & 0x7f800000u) != 0x7f800000u)
-        bits += 0x7fffu + ((bits >> 16u) & 1u);
-    return as_type<float>(bits & 0xffff0000u);
-}
-
 static inline float dsv41_pow2_ceil(float x) {
     const uint bits = as_type<uint>(x);
     return as_type<float>((bits & 0x7f800000u) +
