@@ -43637,6 +43637,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                 active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
             ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+        /* On one Metal device each layer is submitted without waiting, so the
+         * GPU runs it while the next one is encoded. CUDA's flush is a device
+         * synchronize, so it stays out of the layer loop. */
+        if (ok && DS41_METAL && g->tp_world == 1) ok = ds4_gpu_flush_commands();
     }
     /* Readers must finish before the sessions' host rows can be reused. */
     for (int i = 0; i < count; i++)
