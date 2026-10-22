@@ -46170,6 +46170,7 @@ int ds4_gpu_hc_expand_add_tensor(
 static int ds4_gpu_hc_expand_split(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
@@ -46186,6 +46187,7 @@ static int ds4_gpu_hc_expand_split(
 
     @autoreleasepool {
         id<MTLBuffer> blockbuf = ds4_gpu_tensor_buffer(block_out);
+        id<MTLBuffer> addbuf = ds4_gpu_tensor_buffer(block_add ? block_add : block_out);
         id<MTLBuffer> resbuf = ds4_gpu_tensor_buffer(residual_hc);
         id<MTLBuffer> splitbuf = ds4_gpu_tensor_buffer(split);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out_hc);
@@ -46218,8 +46220,9 @@ static int ds4_gpu_hc_expand_split(
         const uint64_t block_bytes = n_tokens64 * block_values * sizeof(float);
         const uint64_t hc_bytes = n_tokens64 * hc_values * sizeof(float);
         const uint64_t split_bytes = n_tokens64 * mix_hc * sizeof(float);
-        if (!blockbuf || !resbuf || !splitbuf || !outbuf ||
+        if (!blockbuf || !addbuf || !resbuf || !splitbuf || !outbuf ||
             ds4_gpu_tensor_bytes(block_out) < block_bytes ||
+            (block_add && ds4_gpu_tensor_bytes(block_add) < block_bytes) ||
             ds4_gpu_tensor_bytes(residual_hc) < hc_bytes ||
             ds4_gpu_tensor_bytes(split) < split_bytes) {
             fprintf(stderr, "ds4: Metal HC expand split received undersized activation buffers\n");
@@ -46245,7 +46248,7 @@ static int ds4_gpu_hc_expand_split(
             .nb0 = sizeof(float),
             .nb1 = (uint64_t)n_embd * sizeof(float),
             .nb2 = (uint64_t)n_hc * n_embd * sizeof(float),
-            .has_add = 0,
+            .has_add = block_add != NULL,
             .bf16 = bf16,
         };
         id<MTLComputePipelineState> expand_pipeline = g_hc_expand_pipeline;
@@ -46275,7 +46278,7 @@ static int ds4_gpu_hc_expand_split(
         [enc setBuffer:resbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:2];
         [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float) atIndex:3];
         [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float) atIndex:4];
-        [enc setBuffer:blockbuf offset:ds4_gpu_tensor_offset(block_out) atIndex:5];
+        [enc setBuffer:addbuf offset:ds4_gpu_tensor_offset(block_add ? block_add : block_out) atIndex:5];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_hc) atIndex:6];
         [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
@@ -46290,15 +46293,21 @@ static int ds4_gpu_hc_expand_split(
 int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,
         const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
         uint32_t n_embd, uint32_t n_hc) {
-    return ds4_gpu_hc_expand_split(out_hc, block_out, residual_hc, split, n_embd, n_hc, false);
+    return ds4_gpu_hc_expand_split(out_hc, block_out, NULL, residual_hc, split, n_embd, n_hc, false);
 }
 
 /* Unlike CUDA, the block is also rounded on load, so it may be unrounded. */
+int ds4_gpu_dsv41_hc_expand_add(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *add, const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *split, uint32_t width, uint32_t rows) {
+    return out && ds4_gpu_tensor_bytes(out) == (uint64_t)width * 4u * rows * sizeof(float) &&
+        ds4_gpu_hc_expand_split(out, block, add, residual, split, width, 4, true);
+}
+
 int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
         const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
         uint32_t width, uint32_t rows) {
-    return out && ds4_gpu_tensor_bytes(out) == (uint64_t)width * 4u * rows * sizeof(float) &&
-        ds4_gpu_hc_expand_split(out, block, residual, split, width, 4, true);
+    return ds4_gpu_dsv41_hc_expand_add(out, block, NULL, residual, split, width, rows);
 }
 
 int ds4_gpu_hc_expand_split_half_tensor(

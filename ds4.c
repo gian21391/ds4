@@ -41941,9 +41941,6 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #ifndef DS4_ROCM_BUILD
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
 #endif
-#ifdef __APPLE__
-    if (shared_queued && !ds41_bf16(g->shared, DS4_N_EMBD)) return false;
-#endif
     if (!routed_ok) return false;
     /* The balanced path writes zero on the non-owning rank. Keep the shared
      * expert's BF16 boundary, then include it once in the F32 rank reduction. */
@@ -41957,7 +41954,9 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
-    /* The Metal BF16 HC expand rounds the block on load. */
+    /* The Metal BF16 HC expand rounds the block on load. On one device it
+     * also adds the shared expert, rounded on load (ds41_graph_after_moe). */
+    if (DS41_METAL && g->tp_world < 2) return true;
     if (!shared_owner && !ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) return false;
     return DS41_METAL || ds41_bf16(g->block, DS4_N_EMBD);
 }
@@ -42289,8 +42288,15 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
-    return ds41_hc_expand(g->residual, g->block, g->after_attn, g->ffn_split) &&
-        ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
+#ifdef __APPLE__
+    const bool ok = g->tp_world < 2 ?
+        ds4_gpu_dsv41_hc_expand_add(g->residual, g->routed, g->shared, g->after_attn,
+                                    g->ffn_split, DS4_N_EMBD, 1) :
+        ds41_hc_expand(g->residual, g->block, g->after_attn, g->ffn_split);
+#else
+    const bool ok = ds41_hc_expand(g->residual, g->block, g->after_attn, g->ffn_split);
+#endif
+    return ok && ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
