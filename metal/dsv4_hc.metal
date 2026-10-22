@@ -907,7 +907,9 @@ kernel void kernel_dsv4_shared_down_hc_expand4_q8_0(
 //
 // This is the no-add sibling of the shared-down/FFN fusion above.  It preserves
 // the exact Q8_0 matvec reduction, stores `attn_out` for diagnostics, and then
-// writes the four HC streams for the same embedding dimension.
+// writes the four HC streams for the same embedding dimension. V4.1 sets bf16
+// to round the block before the expand and the output on store, as
+// kernel_dsv4_hc_expand4 does, with its explicit FMA chain.
 kernel void kernel_dsv4_q8_hc_expand4_q8_0(
         constant ds4_metal_args_mul_mv        & mv,
         constant ds4_metal_args_dsv4_hc_expand & hc,
@@ -997,6 +999,7 @@ kernel void kernel_dsv4_q8_hc_expand4_q8_0(
         const float block_v = simd_sum(shmem_f32[row][tiisg]);
         if (tiisg == 0 && sgitg == 0) {
             *((device float *)(block_out + (uint64_t)d * sizeof(float))) = block_v;
+            const float block_e = hc.bf16 ? dsv41_bf16(block_v) : block_v;
 
             const float r0 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1));
             const float r1 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1));
@@ -1004,14 +1007,14 @@ kernel void kernel_dsv4_q8_hc_expand4_q8_0(
             const float r3 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1));
 
             for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
-                float acc = block_v * *((device const float *)(post + dst_hc * hc.nb_post0));
+                float acc = block_e * *((device const float *)(post + dst_hc * hc.nb_post0));
 
-                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1)) * r0;
-                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1)) * r1;
-                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1)) * r2;
-                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1)) * r3;
+                acc = fma(*((device const float *)(comb + dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1)), r0, acc);
+                acc = fma(*((device const float *)(comb + dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1)), r1, acc);
+                acc = fma(*((device const float *)(comb + dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1)), r2, acc);
+                acc = fma(*((device const float *)(comb + dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1)), r3, acc);
 
-                *((device float *)(dst + (uint64_t)d * hc.nb0 + dst_hc * hc.nb1)) = acc;
+                *((device float *)(dst + (uint64_t)d * hc.nb0 + dst_hc * hc.nb1)) = hc.bf16 ? dsv41_bf16(acc) : acc;
             }
         }
     }

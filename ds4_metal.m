@@ -46657,7 +46657,7 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
     return 1;
 }
 
-int ds4_gpu_matmul_q8_0_hc_expand_tensor(
+static int ds4_gpu_matmul_q8_0_hc_expand(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
         const void             *model_map,
@@ -46669,7 +46669,8 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) {
+        uint32_t                n_hc,
+        bool                    bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out_hc || !block_out || !model_map || !x || !residual_hc || !split ||
         n_embd == 0 || n_hc == 0 || n_hc != 4 || out_dim != n_embd ||
@@ -46736,10 +46737,11 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
             .nb1 = (uint64_t)n_embd * sizeof(float),
             .nb2 = (uint64_t)n_hc * n_embd * sizeof(float),
             .has_add = 0,
+            .bf16 = bf16,
         };
 
         const NSUInteger split_offset = ds4_gpu_tensor_offset(split);
-        const bool vec_hc =
+        const bool vec_hc = !bf16 &&
             (split_offset & 15u) == 0u &&
             getenv("DS4_METAL_DISABLE_M5_Q8_HC_VEC") == NULL &&
             ds4_gpu_device_is_m5_apple_silicon();
@@ -46781,6 +46783,23 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_matmul_q8_0_hc_expand_tensor(ds4_gpu_tensor *out_hc, ds4_gpu_tensor *block_out,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+        uint32_t n_embd, uint32_t n_hc) {
+    return ds4_gpu_matmul_q8_0_hc_expand(out_hc, block_out, model_map, model_size,
+        weight_offset, in_dim, out_dim, x, residual_hc, split, n_embd, n_hc, false);
+}
+
+int ds4_gpu_dsv41_attention_output_expand(ds4_gpu_tensor *out, ds4_gpu_tensor *block,
+        const void *model_map, uint64_t model_size, uint64_t out_b_offset,
+        uint32_t in_dim, const ds4_gpu_tensor *low, const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *split, uint32_t width) {
+    return ds4_gpu_matmul_q8_0_hc_expand(out, block, model_map, model_size, out_b_offset,
+        in_dim, width, low, residual, split, width, 4, true);
 }
 
 

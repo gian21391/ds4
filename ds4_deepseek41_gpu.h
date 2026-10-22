@@ -105,6 +105,12 @@ int ds4_gpu_dsv41_attention_output_low(
         ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
         uint32_t n_groups, const ds4_gpu_tensor *heads);
+/* Single device: the Q8 wo_b projection of the low rows into block, with the
+ * BF16 HC expand of the block (rounded on load) into out. */
+int ds4_gpu_dsv41_attention_output_expand(ds4_gpu_tensor *out, ds4_gpu_tensor *block,
+        const void *model_map, uint64_t model_size, uint64_t out_b_offset,
+        uint32_t in_dim, const ds4_gpu_tensor *low, const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *split, uint32_t width);
 /* The decode HC mix as DeepSeek computes it: split-K partials of x.fn (F16 fn,
  * 24 rows) and of sum(x^2), then their reduction with the RMS scale applied
  * after the projection and the HC split. part holds 64 x 25 floats. */

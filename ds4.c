@@ -41726,6 +41726,12 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
         ds41_matmul(g->block, m, l->attn_output_b, g->low, false);
 }
 
+/* On one Metal device the decode wo_b matvec also applies the attention HC
+ * expand, so ds41_graph_after_attention starts from after_attn. */
+static bool ds41_attention_expands(const ds41_gpu_graph *g, const ds4_layer_weights *l) {
+    return DS41_METAL && g->tp_world < 2 && l->attn_output_b->type == DS4_TENSOR_Q8_0;
+}
+
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                                    const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -41878,6 +41884,13 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
 #endif
     if (projected) return true;
+#ifdef __APPLE__
+    if (ds41_attention_expands(g, l))
+        return ds41_attention_low(g, m, l) &&
+            ds4_gpu_dsv41_attention_output_expand(g->after_attn, g->block, m->map, m->size,
+                l->attn_output_b->abs_offset, (uint32_t)l->attn_output_b->dim[0], g->low,
+                g->residual, g->attn_split, DS4_N_EMBD);
+#endif
     /* The Metal BF16 HC expand rounds the block on load. */
     return ds41_attention_output(g, m, l) &&
         ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
@@ -42051,9 +42064,10 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
         ds41_hc_sum_norm(g, g->residual, g->pre, false, m, l->attn_norm);
 }
 
+/* Expanded: the attention output already wrote after_attn. */
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
-                                      const ds4_layer_weights *l) {
-    return ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split) &&
+                                      const ds4_layer_weights *l, bool expanded) {
+    return (expanded || ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split)) &&
         ds41_hc_mix(g, m, l, true) &&
         ds41_hc_sum_norm(g, g->after_attn, g->attn_split, true, m, l->ffn_norm);
 }
@@ -42061,7 +42075,7 @@ static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_layer_weights *l, uint32_t il) {
     return ds41_graph_before_attention(g, m, l, il) && ds41_attention(g, m, l, il, false) &&
-        ds41_graph_after_attention(g, m, l);
+        ds41_graph_after_attention(g, m, l, ds41_attention_expands(g, l));
 }
 
 static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
@@ -42381,7 +42395,7 @@ static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
     if ((!normed && !ds41_graph_before_attention(g, m, l, il)) ||
         (normed && !ds41_hc_mix(g, m, l, false)) ||
         !ds41_attention(g, m, l, il, false) ||
-        !ds41_graph_after_attention(g, m, l) ||
+        !ds41_graph_after_attention(g, m, l, ds41_attention_expands(g, l)) ||
         !ds41_moe(g, m, l, il, (uint32_t)token)) return false;
 #ifdef __APPLE__
     if (next_norm)
@@ -42411,7 +42425,7 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
         const bool ok = island == 0 ?
             ds41_graph_before_attention(g, m, l, il) && ds41_attention_project(g, m, l) :
             island == 2 ? ds41_attention_output(g, m, l) :
-            ds41_graph_after_attention(g, m, l) && ds41_moe_partial(g, m, l, il, 0);
+            ds41_graph_after_attention(g, m, l, false) && ds41_moe_partial(g, m, l, il, 0);
         if (state != 0) return ok;
         if (!ok) ds4_gpu_decode_graph_abort(&key);
         else if (ds4_gpu_decode_graph_end(&key) == 0) return true;
@@ -43191,7 +43205,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #define DS41_USE_FFN_ROW(name, width) row.name = g->rows_view[t].name;
                     DS41_PREFILL_ROWS(DS41_USE_FFN_ROW)
 #undef DS41_USE_FFN_ROW
-                    ok = ds41_graph_after_attention(&row, m, l);
+                    ok = ds41_graph_after_attention(&row, m, l, false);
                     if (ok && !batch_moe) ok = ds41_moe(&row, m, l, il, (uint32_t)tokens[off + t]) &&
                         ds41_graph_after_moe(&row);
                 }
