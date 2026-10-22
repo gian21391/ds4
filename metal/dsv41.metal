@@ -37,8 +37,8 @@ struct ds4_metal_args_dsv41_rope {
     float frequencies[32];
 };
 
-/* Shared and noinline so the RoPEs fused into other kernels compile to the
- * same arithmetic as this kernel's. */
+/* Shared and noinline so the RoPEs fused into the attention and its reduce
+ * compile to the same arithmetic as this kernel's. */
 static __attribute__((noinline)) float2 dsv41_rope_pair(float re, float im, float theta,
                                                         uint inverse) {
     const float c = precise::cos(theta);
@@ -58,6 +58,188 @@ kernel void kernel_dsv41_rope(
     x[i] = y.x;
     x[i + 1u] = y.y;
 }
+
+// Decode attention reduce followed by the BF16 store and the RoPE of the one
+// head row each threadgroup owns: the same arithmetic as the plain reduce,
+// kernel_dsv41_bf16_linear and kernel_dsv41_rope in turn.
+kernel void kernel_dsv41_flash_attn_reduce_rope(
+        constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
+        device  const char * htmp,
+        device        char * dst,
+        constant ds4_metal_args_dsv41_rope & rope,
+        constant uint & splits,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    ds4_flash_attn_vec_reduce_row(args, htmp, dst, tgpig, tiisg, sgitg,
+                                  (short)FC_flash_attn_ext_vec_reduce_NWG,
+                                  (short)FC_flash_attn_ext_vec_reduce_DV, (short)splits);
+    threadgroup_barrier(mem_flags::mem_device);
+    device float *x = (device float *)dst + (ulong)tgpig * rope.width;
+    const uint tail = rope.width - 64u;
+    for (uint i = tiitg; i < tail; i += 32u * FC_flash_attn_ext_vec_reduce_NWG)
+        x[i] = dsv41_bf16(x[i]);
+    if (sgitg != 0) return;
+    const float theta = float(rope.start) * rope.frequencies[tiisg];
+    const uint i = tail + 2u * tiisg;
+    const float2 y = dsv41_rope_pair(dsv41_bf16(x[i]), dsv41_bf16(x[i + 1u]), theta, rope.inverse);
+    x[i] = y.x;
+    x[i + 1u] = y.y;
+}
+
+struct ds4_metal_args_dsv41_flash_attn {
+    uint n_raw;
+    uint raw_cap;
+    uint raw_start;
+    uint n_comp;
+    uint n_head;
+    float scale;
+};
+
+// One online-softmax step over a key score s per lane: moves the running max
+// M, rescales the sum S and the outputs so4, and returns exp(s - M).
+static inline float dsv41_softmax_step(thread float &M, thread float &S, float s,
+                                       thread float4 *so4) {
+    const float m = M;
+
+    M = simd_max(max(M, s));
+
+    const float ms = exp(m - M);
+    const float vs = exp(s - M);
+
+    S = S*ms + simd_sum(vs);
+
+    FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
+        so4[ii] *= ms;
+    }
+    return vs;
+}
+
+// Decode FlashAttention over the raw window ring and the selected compressed
+// rows, gathered in place: the arithmetic of kernel_flash_attn_ext_vec_f16_dk512_dv512
+// (one simdgroup per head and split, 32 splits of 32-key chunks, zero mask)
+// without its F16 staging copies. Eight heads share each chunk staged in
+// threadgroup memory; the partials feed kernel_dsv41_flash_attn_reduce_rope.
+// Only the splits that hold keys run.
+// It also rounds q to BF16 and applies kernel_dsv41_rope to it as it loads
+// it, and stores the new KV row in its window slot while reading that row
+// from kv.
+kernel void kernel_dsv41_flash_attn_decode(
+        constant ds4_metal_args_dsv41_flash_attn &args,
+        device const float *q,
+        device const float *kv,
+        device float *raw,
+        device const float *comp,
+        device const int *ids,
+        device const float *sinks,
+        device float *dst,
+        constant ds4_metal_args_dsv41_rope &rope,
+        threadgroup half4 *kv4 [[threadgroup(0)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    constexpr short C = 32, NWG = 32, DV4 = 128;
+    const uint head = tgpig.x * nsg + sgitg;
+    const short iwg = tgpig.y;
+    const uint n_keys = args.n_raw + args.n_comp;
+
+    const uint last = (args.raw_start + args.n_raw - 1u) % args.raw_cap;
+    if (tgpig.x == 0 && tgpig.y == 0 && tiitg < DV4)
+        ((device float4 *)raw)[last * DV4 + tiitg] = ((device const float4 *)kv)[tiitg];
+
+    device const float4 *q4 = (device const float4 *)(q + (ulong)head * 512u);
+    half4 sq4[4];
+    float4 so4[4];
+    FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
+        float4 x = dsv41_bf16(q4[ii * 32 + tiisg]);
+        if (ii == 3 && tiisg >= 16) {
+            FOR_UNROLL (short p = 0; p < 2; ++p) {
+                const float theta = float(rope.start) * rope.frequencies[2 * (tiisg - 16) + p];
+                const float2 y = dsv41_rope_pair(x[2 * p], x[2 * p + 1], theta, rope.inverse);
+                x[2 * p] = y.x;
+                x[2 * p + 1] = y.y;
+            }
+        }
+        sq4[ii] = (half4)x;
+        so4[ii] = 0.0f;
+    }
+
+    float S = 0.0f;
+    float M = -FLT_MAX/2;
+
+    for (uint ic = iwg * C; ic < n_keys; ic += NWG * C) {
+        /* Stage the chunk's 32 rows in F16, as the F16 KV copy did. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            /* Eight threads per row, all loads in flight at once. */
+            const uint r = tiitg / 8u, part = tiitg % 8u, key = ic + r;
+            device const float4 *src = nullptr;
+            if (key + 1u == args.n_raw) {
+                src = (device const float4 *)kv;
+            } else if (key < args.n_raw) {
+                src = (device const float4 *)(raw + (ulong)((args.raw_start + key) % args.raw_cap) * 512u);
+            } else if (key < n_keys) {
+                src = (device const float4 *)(comp + (ulong)ids[key - args.n_raw] * 512u);
+            }
+            float4 x[DV4 / 8];
+            FOR_UNROLL (short k = 0; k < DV4 / 8; ++k) {
+                x[k] = src ? src[part + 8 * k] : 0.0f;
+            }
+            FOR_UNROLL (short k = 0; k < DV4 / 8; ++k) {
+                kv4[r * DV4 + part + 8 * k] = (half4)x[k];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const half sm = ic + tiisg < n_keys ? 0.0h : -MAXHALF;
+
+        /* Fully unrolled, the two key loops cost several times more. */
+        float s = 0.0f;
+#pragma clang loop unroll_count(4)
+        for (short cc = 0; cc < C; ++cc) {
+            float mqk = 0.0f;
+            FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
+                mqk += dot((float4)kv4[cc * DV4 + ii * 32 + tiisg], (float4)sq4[ii]);
+            }
+            mqk = simd_sum(mqk);
+            if (cc == tiisg) s = fma(mqk, args.scale, (float)sm);
+        }
+
+        s = dsv41_softmax_step(M, S, s, so4);
+
+        {
+            float4 lo[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma clang loop unroll_count(4)
+            for (short cc = 0; cc < C; ++cc) {
+                const float w = simd_shuffle(s, cc);
+                FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
+                    lo[ii] += float4(float4(kv4[cc * DV4 + ii * 32 + tiisg])*float4(w));
+                }
+            }
+            FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
+                so4[ii] += lo[ii];
+            }
+        }
+    }
+
+    if (iwg == 0) {
+        dsv41_softmax_step(M, S, tiisg == 0 ? sinks[head] : -FLT_MAX/2, so4);
+    }
+
+    device float4 *dst4 = (device float4 *)dst;
+    device float *dst1 = dst + (ulong)args.n_head * 512u * NWG;
+    FOR_UNROLL (short ii = 0; ii < 4; ++ii) {
+        dst4[((ulong)head * NWG + iwg) * DV4 + ii * 32 + tiisg] = so4[ii];
+    }
+    if (tiisg == 0) {
+        dst1[head * (2 * NWG) + 2 * iwg + 0] = S;
+        dst1[head * (2 * NWG) + 2 * iwg + 1] = M;
+    }
+}
+
 
 /* One lane of a quantization block: the block's simdgroup lanes hold the
  * BF16-rounded values (zero past the block). */

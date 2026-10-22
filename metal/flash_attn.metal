@@ -1352,7 +1352,7 @@ kernel void kernel_flash_attn_ext_vec(
         const float S = NWG == 1 ? (ss[0] == 0.0f ? 0.0f : 1.0f/ss[0]) : 1.0f;
 
         for (short i = tiisg; i < DV4; i += NW) {
-            dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[i]*S;
+            dst4[(rid*NWG + iwg)*DV4 + i] = (float4) so4[i]*S;
         }
 
         if (NWG > 1) {
@@ -1400,7 +1400,8 @@ constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_A
 // output vector and softmax (sum,max) pair into the final attention result.
 /* Shared and deliberately noinline so the split-K reduction is compiled once and
  * every caller gets identical codegen. The RoPE-fused sibling in dsv4_rope.metal
- * calls this same body, which is what keeps the fusion bit-exact. */
+ * calls this same body, which is what keeps the fusion bit-exact. Splits from
+ * nsplit on were not written and count as empty: no keys and no sink. */
 static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
         constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
         device  const char * htmp,
@@ -1409,15 +1410,16 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
         ushort tiisg,
         ushort sgitg,
         short  NWG_,
-        short  DV_) {
+        short  DV_,
+        short  nsplit) {
     const uint64_t rid = tgpig;
 
     const short iwg = tiisg;
 
     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV_*NWG_;
 
-    float S = ss[rid*(2*NWG_) + 2*iwg + 0];
-    float M = ss[rid*(2*NWG_) + 2*iwg + 1];
+    float S = iwg < nsplit ? ss[rid*(2*NWG_) + 2*iwg + 0] : 0.0f;
+    float M = iwg < nsplit ? ss[rid*(2*NWG_) + 2*iwg + 1] : -FLT_MAX/2;
 
     const float m  = simd_max(M);
     const float ms = exp(M - m);
@@ -1431,7 +1433,7 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
     for (short i = sgitg; i < DV4; i += NWG_) {
-        const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
+        const float4 v = simd_sum((iwg < nsplit ? htmp4[iwg*DV4 + i] : 0.0f)*ms);
 
         if (iwg == 0) {
             dst4[i] = v*S;
@@ -1448,7 +1450,8 @@ kernel void kernel_flash_attn_ext_vec_reduce(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     ds4_flash_attn_vec_reduce_row(args, htmp, dst, tgpig, tiisg, sgitg,
                                   (short)FC_flash_attn_ext_vec_reduce_NWG,
-                                  (short)FC_flash_attn_ext_vec_reduce_DV);
+                                  (short)FC_flash_attn_ext_vec_reduce_DV,
+                                  (short)FC_flash_attn_ext_vec_reduce_NWG);
 }
 
 // M5 decode specialization: time-slice all 32 split-K workgroups through eight

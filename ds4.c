@@ -40940,6 +40940,14 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     return cap > chunk ? (uint32_t)cap : 0;
 }
 
+/* Metal decode attention reads the selected compressed rows in place; the
+ * CUDA and ROCm decode gathers them for the generic attention kernel. */
+#ifdef __APPLE__
+#define DS41_GATHER_SCRATCH(X)
+#else
+#define DS41_GATHER_SCRATCH(X) X(selected_kv, DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM)
+#endif
+
 #define DS41_SCRATCH(X) \
     X(image_text_mask, (g->prefill_cap + 3u) / 4u) \
     X(residual, DS4_N_HC * DS4_N_EMBD) \
@@ -40955,7 +40963,7 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(index_k, DS4_N_INDEXER_HEAD_DIM) X(index_weights, DS4_N_INDEXER_HEAD) \
     X(index_scores, DS41_INDEX_BATCH * g->ctx) X(selected_comp, DS4_N_INDEXER_TOP_K) \
     X(index_packed, ds4_gpu_dsv41_indexer_packed_bytes(g->ctx, g->prefill_cap) / 4u) \
-    X(selected_kv, DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM) \
+    DS41_GATHER_SCRATCH(X) \
     X(block_scores, (g->ctx + 7u) / 8u) X(block_selected, 2048) \
     X(block_mask, (g->ctx + 7u) / 8u) \
     X(heads, DS4_N_HEAD * DS4_N_HEAD_DIM) X(low, DS4_N_OUT_GROUP * DS4_N_LORA_O) \
@@ -41418,6 +41426,7 @@ fail:
     return false;
 }
 #undef DS41_SCRATCH
+#undef DS41_GATHER_SCRATCH
 
 static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
@@ -41801,11 +41810,25 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
     return ds41_attention_pick(g, il);
 }
 
-static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
-                                  const ds4_layer_weights *l, uint32_t il) {
-    return ds41_attention_publish(g, m, l, il) &&
-        ds41_attention_select_published(g, m, l, il);
+#ifdef __APPLE__
+/* The attention partials, or their reduce: the attention ropes q, stores the
+ * window row and reads the selected compressed rows itself; its reduce rounds
+ * the heads and applies the inverse RoPE. */
+static bool ds41_attention_decode(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t il,
+                                  uint32_t slot, bool reduce) {
+    const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    const uint32_t heads = DS4_N_HEAD / g->tp_world;
+    const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
+    const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
+    const uint64_t sinks = l->attn_sinks->abs_offset + (uint64_t)g->tp_rank * heads * sizeof(float);
+    return ds4_gpu_dsv41_attention_decode(g->heads, m->map, m->size, sinks,
+            g->q, g->kv, g->window[il], n_raw, 128, g->compressed[owner],
+            g->selected_comp, n_comp, attended, heads, pos, ratio != 0, slot, reduce);
 }
+#endif
 
 static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l) {
@@ -41820,34 +41843,40 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, bool projected) {
+#ifdef __APPLE__
+    const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
+    if ((!projected && !ds41_attention_project(g, m, l)) ||
+        !ds4_gpu_dsv41_rope_quantize(g->kv, DS4_N_HEAD_DIM, 1, pos, ratio != 0,
+                                     DS4_V41_FP8_E8M0) ||
+        !ds41_attention_publish(g, m, l, il) ||
+        !ds41_attention_select_published(g, m, l, il) ||
+        !ds41_attention_decode(g, m, l, il, 0, false) ||
+        !ds41_attention_decode(g, m, l, il, 0, true)) return false;
+#else
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
-    if (!projected && !ds41_attention_project(g, m, l)) return false;
-    if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
-#ifdef __APPLE__
-        !ds4_gpu_dsv41_rope_quantize(g->kv, DS4_N_HEAD_DIM, 1, pos, ratio != 0,
-                                     DS4_V41_FP8_E8M0) ||
-#else
+    if ((!projected && !ds41_attention_project(g, m, l)) ||
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
-#endif
-        !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
-                             g->kv, 0, 512u * 4u) ||
-        !ds41_attention_select(g, m, l, il)) return false;
+        !ds41_attention_publish(g, m, l, il) ||
+        !ds41_attention_select_published(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
-    if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
-                                         g->selected_comp, n_comp, attended)) return false;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
-    if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
-            l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
-            g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
-            g->selected_kv, 0, attended, NULL, 0,
-            heads, DS4_N_HEAD_DIM) ||
-        !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
+    const uint64_t sinks = l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float);
+    const bool ok = ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) &&
+        ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
+                            g->kv, 0, 512u * 4u) &&
+        (!n_comp || ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+                                            g->selected_comp, n_comp, attended)) &&
+        ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size, sinks,
+            g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u, g->selected_kv, 0,
+            attended, NULL, 0, heads, DS4_N_HEAD_DIM);
+    if (!ok || !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
+#endif
     if (projected) return true;
     /* The Metal BF16 HC expand rounds the block on load. */
     return ds41_attention_output(g, m, l) &&

@@ -528,7 +528,9 @@ static int check_candidates(void) {
     return 1;
 }
 
+/* Metal decode attention reads the selected rows in place, without a gather. */
 static int check_sparse_gather(void) {
+#ifndef __APPLE__
     const uint32_t sizes[] = {1, 3, 511, 512, 513, 8193, 17017};
     for (size_t i = 0; i < sizeof(sizes) / sizeof(*sizes); i++) {
         const uint32_t rows = sizes[i], selected = rows < 512 ? rows : 512;
@@ -550,6 +552,7 @@ static int check_sparse_gather(void) {
         ds4_gpu_tensor_free(source); ds4_gpu_tensor_free(ids); ds4_gpu_tensor_free(out);
     }
     fprintf(stderr, "V4.1 bounded sparse KV gather: exact\n");
+#endif
     return 1;
 }
 
