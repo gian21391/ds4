@@ -5403,15 +5403,15 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     };
 }
 
-/* Single-token F16/F32 matvecs with few output rows (the Qwen hyper-connection
- * low-rank down projections and routers) launch one row per SIMD group on M5,
- * where two-row tiles leave most of the 40 cores idle.  The per-row K walk,
+/* Single-token F16/F32 matvecs with few output rows (hyper-connection mixes,
+ * low-rank down projections and routers) launch one row per threadgroup,
+ * where two-row tiles leave most of the GPU cores idle.  The per-row K walk,
  * simdgroup count and reduction tree are unchanged.  DS4_METAL_PLAIN_MV_NR0
- * forces 1 or 2 rows on any device. */
+ * forces 1 or 2 rows. */
 static bool ds4_gpu_plain_mv_single_row(uint64_t out_dim) {
     const uint64_t override = ds4_gpu_env_u64("DS4_METAL_PLAIN_MV_NR0", 0u, 0u, 2u);
     if (override) return override == 1u;
-    return out_dim <= 1024u && ds4_gpu_device_is_m5_apple_silicon();
+    return out_dim <= 1024u;
 }
 
 static ds4_gpu_mv_dispatch ds4_gpu_make_plain_mv_dispatch(
