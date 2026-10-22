@@ -92,6 +92,75 @@ template [[host_name("kernel_rms_norm_f32_4")]]     kernel kernel_rms_norm_fuse_
 template [[host_name("kernel_rms_norm_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 template [[host_name("kernel_dsv41_rms_norm_mul_bf16_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2, true>;
 
+// The norm half of the fused V4.1 HC sum + BF16 RMSNorm kernel below: the
+// reduction of kernel_rms_norm_fuse_impl, then its BF16 weighted store of the
+// rows x each thread wrote.
+static inline void dsv41_hc_rms_norm_mul_bf16(
+        constant ds4_metal_args_norm & args,
+        float sumf,
+        device const float4 * x,
+        device const float4 * norm_weight,
+        device       float4 * dst,
+        threadgroup float * shmem_f32,
+        ushort3 tpitg,
+        ushort  sgitg,
+        ushort  tiisg,
+        ushort3 ntg) {
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean  = sumf/args.ne00;
+    const float scale = 1.0f/sqrt(mean + args.eps);
+
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        // As in kernel_rms_norm_fuse_impl: reload the rounded input.
+        dst[i00] = x[i00];
+        dst[i00] = dsv41_bf16((((device volatile float4 *) dst)[i00]*scale)*norm_weight[i00]);
+    }
+}
+
+// V4.1 decode HC=4 weighted sum (BF16 store) followed by the BF16 weighted
+// RMSNorm, in one threadgroup with the norm's thread mapping: each thread
+// sums the rows it then reduces.
+kernel void kernel_dsv41_hc_sum_rms_norm_mul_bf16_f32_4(
+        constant ds4_metal_args_norm & args,
+        device const float4 * hc,
+        device const float  * w,
+        device       float4 * x,
+        device const float4 * norm_weight,
+        device       float4 * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    float sumf = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        float4 acc = 0.0f;
+        for (int h = 0; h < 4; ++h) {
+            acc += hc[h*args.ne00_t + i00] * w[h];
+        }
+        const float4 v = dsv41_bf16(acc);
+        x[i00] = v;
+        sumf += dot(v, v);
+    }
+    dsv41_hc_rms_norm_mul_bf16(args, sumf, x, norm_weight, dst, shmem_f32, tpitg, sgitg, tiisg, ntg);
+}
+
 kernel void kernel_add_rms_norm_mul_f32_4(
         constant ds4_metal_args_norm & args,
         device const char * src0,

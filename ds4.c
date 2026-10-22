@@ -41592,9 +41592,10 @@ static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
         ds41_bf16(out, (uint32_t)weight->dim[0]);
 }
 
+#ifndef __APPLE__
 static bool ds41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                         const ds4_gpu_tensor *weights, bool split) {
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#ifndef DS4_ROCM_BUILD
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_hc_sum(out, in, weights, DS4_N_EMBD, 1, split ? 24u : 4u);
 #endif
@@ -41602,6 +41603,7 @@ static bool ds41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
         ds4_gpu_hc_weighted_sum_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC)) &&
         ds41_bf16(out, DS4_N_EMBD);
 }
+#endif
 
 static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
                           const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split) {
@@ -41655,6 +41657,19 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
            ds4_gpu_hc_split_sinkhorn_tensor(ffn ? g->ffn_split : g->attn_split,
                g->mix, m->map, m->size, scale->abs_offset, base->abs_offset,
                DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
+}
+
+/* The HC sum and the norm of the sum; one kernel on Metal. */
+static bool ds41_hc_sum_norm(ds41_gpu_graph *g, const ds4_gpu_tensor *in,
+                             const ds4_gpu_tensor *weights, bool split,
+                             const ds4_model *m, const ds4_tensor *weight) {
+#ifdef __APPLE__
+    (void)split;
+    return ds4_gpu_dsv41_hc_sum_norm(g->norm, g->x, in, weights, m->map, m->size,
+        weight->abs_offset, DS4_N_EMBD, DS4_RMS_EPS);
+#else
+    return ds41_hc_sum(g->x, in, weights, split) && ds41_norm(g->norm, g->x, m, weight);
+#endif
 }
 
 static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
@@ -41954,8 +41969,7 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_logits_encode(ds41_gpu_graph *g, const ds4_model *m,
                                      const ds4_weights *w) {
-    return ds41_hc_sum(g->x, g->residual, g->pre, false) &&
-           ds41_norm(g->norm, g->x, m, w->output_norm) &&
+    return ds41_hc_sum_norm(g, g->residual, g->pre, false, m, w->output_norm) &&
            ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
                                    m, w, g->norm, 1);
 }
@@ -41981,14 +41995,14 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
     }
     return ds41_dspark_capture(g->dspark, il, g->pos, g->residual, 1) &&
         ds41_hc_mix(g, m, l, false) &&
-        ds41_hc_sum(g->x, g->residual, g->pre, false) && ds41_norm(g->norm, g->x, m, l->attn_norm);
+        ds41_hc_sum_norm(g, g->residual, g->pre, false, m, l->attn_norm);
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
     return ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split) &&
         ds41_hc_mix(g, m, l, true) &&
-        ds41_hc_sum(g->x, g->after_attn, g->attn_split, true) && ds41_norm(g->norm, g->x, m, l->ffn_norm);
+        ds41_hc_sum_norm(g, g->after_attn, g->attn_split, true, m, l->ffn_norm);
 }
 
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,

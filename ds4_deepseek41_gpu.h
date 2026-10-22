@@ -35,6 +35,10 @@ int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
         uint32_t width, uint32_t rows);
 #endif
 #ifdef __APPLE__
+/* Metal decode-row fusion: the HC sum (4 pre weights) with its norm. */
+int ds4_gpu_dsv41_hc_sum_norm(ds4_gpu_tensor *out, ds4_gpu_tensor *sum,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *weights,
+        const void *map, uint64_t size, uint64_t offset, uint32_t width, float eps);
 /* Whether the routed experts of rows tokens encode as one fused pair-SwiGLU
  * dispatch and one direct sum6 dispatch: the only route that may share
  * concurrent levels with the shared expert. */
