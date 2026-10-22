@@ -42243,28 +42243,12 @@ static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
             DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
 }
 
-#ifdef __APPLE__
-/* The single-session HC mix (split-K on Metal) for each row of a session
- * batch, so every row decodes as its own session would. */
-static bool ds41_hc_mix_rows(ds41_gpu_graph *g, const ds4_model *m,
-                             const ds4_layer_weights *l, bool ffn, uint32_t count) {
-    for (uint32_t i = 0; i < count; i++) {
-        const ds41_prefill_row *r = &g->rows_view[i];
-        if (!ds4_gpu_dsv41_hc_mix_partial(r->flat_norm, ffn ? r->after_attn : r->residual,
-                m->map, m->size, (ffn ? l->hc_ffn_fn : l->hc_attn_fn)->abs_offset,
-                DS4_N_HC * DS4_N_EMBD) ||
-            !ds4_gpu_dsv41_hc_mix_split(ffn ? r->ffn_split : r->attn_split, r->flat_norm,
-                m->map, m->size, (ffn ? l->hc_ffn_scale : l->hc_attn_scale)->abs_offset,
-                (ffn ? l->hc_ffn_base : l->hc_attn_base)->abs_offset, DS4_N_HC * DS4_N_EMBD,
-                DS4_N_HC_SINKHORN_ITER, DS4_RMS_EPS, DS4_HC_EPS)) return false;
-    }
-    return true;
-}
-#endif
-
+/* decode_rows (Metal session batches): each row's ds41_attention_project
+ * makes its attention HC mix, and the HC sum and its norm run per row with
+ * the single-session kernel, side by side. */
 static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
-                                         uint32_t il, uint32_t count) {
+                                         uint32_t il, uint32_t count, bool decode_rows) {
     if (ds41_engram_layer(il)) {
         const uint32_t i = il == 1 ? 0 : 1;
         if (!ds41_engram_kv(g, b->engram_kv, m, l, i, b->engram_rows, count) ||
@@ -42273,6 +42257,21 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                 DS4_N_EMBD, count, DS4_RMS_EPS))
             return false;
     }
+#ifdef __APPLE__
+    if (decode_rows) {
+        const bool levels = ds4_gpu_concurrent_begin() != 0;
+        bool ok = true;
+        for (uint32_t i = 0; ok && i < count; i++) {
+            const ds41_prefill_row *r = &g->rows_view[i];
+            ok = ds4_gpu_dsv41_hc_sum_norm(r->norm, r->x, r->residual, il ? r->ffn_split : r->pre,
+                m->map, m->size, l->attn_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS);
+        }
+        if (levels) ds4_gpu_concurrent_end();
+        return ok;
+    }
+#else
+    (void)decode_rows;
+#endif
     if (!ds41_hc_mix_batch(b, m, l, false, count)) return false;
     /* V4.1 consumes the preceding sublayer's mixer, not the newly computed one. */
     const bool mixed = il ?
@@ -42335,6 +42334,33 @@ static bool ds41_attention_project_rows(ds41_gpu_graph *g, ds41_prefill_row *b,
     ok = ok && ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr,
                                       g->tp_rank * q_dim, q_dim, count, false) &&
         (!index || ds41_matmul_batch(b->index_q, m, l->indexer_attn_q_b, b->qr, count, false));
+    if (levels) ds4_gpu_concurrent_end();
+    return ok;
+}
+
+/* ds41_graph_after_attention for each row of a session batch, side by side:
+ * the single-session FFN HC mix, sum and norm kernels give every row its own
+ * values, in fewer launches than the batch row kernels. */
+static bool ds41_after_attention_rows(ds41_gpu_graph *g, ds41_prefill_row *b,
+                                      const ds4_model *m, const ds4_layer_weights *l,
+                                      uint32_t count) {
+    bool ok = ds4_gpu_dsv41_hc_expand(b->after_attn, b->block, b->residual, b->attn_split,
+                                      DS4_N_EMBD, count);
+    const bool levels = ds4_gpu_concurrent_begin() != 0;
+    for (uint32_t i = 0; ok && i < count; i++) {
+        const ds41_prefill_row *r = &g->rows_view[i];
+        ok = ds4_gpu_dsv41_hc_mix_partial(r->flat_norm, r->after_attn, m->map, m->size,
+                l->hc_ffn_fn->abs_offset, DS4_N_HC * DS4_N_EMBD) &&
+            ds4_gpu_dsv41_hc_sum_norm(r->norm, r->x, r->after_attn, r->attn_split,
+                m->map, m->size, l->ffn_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS);
+    }
+    ds4_gpu_concurrent_barrier();
+    for (uint32_t i = 0; ok && i < count; i++) {
+        const ds41_prefill_row *r = &g->rows_view[i];
+        ok = ds4_gpu_dsv41_hc_mix_split(r->ffn_split, r->flat_norm, m->map, m->size,
+            l->hc_ffn_scale->abs_offset, l->hc_ffn_base->abs_offset, DS4_N_HC * DS4_N_EMBD,
+            DS4_N_HC_SINKHORN_ITER, DS4_RMS_EPS, DS4_HC_EPS);
+    }
     if (levels) ds4_gpu_concurrent_end();
     return ok;
 }
@@ -43309,7 +43335,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok && batch_hc)
                 ok = ds41_dspark_capture(g->dspark, il, start, active.residual, count) &&
-                    ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count);
+                    ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count, false);
             DS41_STAGE("hc/engram");
             for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                 row.pos = start + t;
@@ -43603,12 +43629,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ok = ds41_dspark_capture(graphs[i]->dspark, il, positions[i],
                 g->rows_view[i].residual, 1);
 #ifdef __APPLE__
-        /* The Metal row attention takes the session batch's projections and
-         * makes each row's attention HC split. */
-        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
+        /* Each row's ds41_attention_project makes its attention HC mix. */
+        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows, true) &&
             ds41_attention_project_rows(g, &active, model, l, il, rows);
 #else
-        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
+        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows, false) &&
             ds41_attention_project_batch(g, model, l, rows);
 #endif
         bool batch_output = false;
@@ -43640,11 +43665,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                     model->map, model->size, l->attn_output_a->abs_offset,
                     l->attn_output_b->abs_offset, g->batch.heads, rows);
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows);
+#ifdef __APPLE__
+        /* The Metal BF16 HC expands round the block on load. */
+        if (ok) ok = ds41_after_attention_rows(g, &active, model, l, rows) &&
+            ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
+            (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
+                (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
+                ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
+            ds4_gpu_dsv41_hc_expand(active.residual, active.block, active.after_attn,
+                active.ffn_split, DS4_N_EMBD, rows);
+#else
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows) &&
-#ifdef __APPLE__
-            ds41_hc_mix_rows(g, model, l, true, rows) &&
-#endif
             ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
@@ -43653,6 +43685,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                 active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
             ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+#endif
         /* On one Metal device each layer is submitted without waiting, so the
          * GPU runs it while the next one is encoded. CUDA's flush is a device
          * synchronize, so it stays out of the layer loop. */
