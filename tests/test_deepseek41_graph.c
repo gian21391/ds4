@@ -1558,7 +1558,7 @@ static int check_partitions(const char *path) {
         REQUIRE(ds41_matmul(g.q, &model, l->attn_q_b, g.qr, true));
         REQUIRE(ds4_gpu_tensor_read(g.q, 0, expected, head_bytes));
         for (uint32_t rank = 0; rank < 2; rank++) {
-            REQUIRE(ds41_matmul_rows(g.q, &model, l->attn_q_b, g.qr, rank * 16384u, 16384));
+            REQUIRE(ds41_matmul_rows_batch(g.q, &model, l->attn_q_b, g.qr, rank * 16384u, 16384, 1, true));
             REQUIRE(ds4_gpu_tensor_read(g.q, 0, actual + rank * 16384u, head_bytes / 2));
         }
         REQUIRE(partition_close("query row split", il, expected, actual, 32768));
