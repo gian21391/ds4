@@ -43468,7 +43468,8 @@ static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int c
         if (!largest || g->ctx > largest->ctx ||
             (g->ctx == largest->ctx && g->prefill_cap > largest->prefill_cap)) largest = g;
     }
-    return largest->prefill_cap >= (uint32_t)count ? largest : NULL;
+    /* Room for the rows of both Engram uploads. */
+    return largest->prefill_cap >= 2u * (uint32_t)count ? largest : NULL;
 }
 
 static bool ds41_cuda_row_batch_supported(const ds41_gpu_graph *g, const ds4_weights *w) {
@@ -43523,6 +43524,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         malloc(prefill_rows * sizeof(*engram)) : NULL;
     ds4_gpu_tensor *queries[DS4_TP_BATCH_MAX_ROWS] = {0};
     ds4_gpu_tensor *heads[DS4_TP_BATCH_MAX_ROWS] = {0};
+    bool reading[DS4_TP_BATCH_MAX_ROWS] = {0};
     bool ok = rows <= g->prefill_cap && (prefill_rows <= 1 || engram);
 #define DS41_SESSION_VIEW(name, width) \
     if (ok) ok = (active.name = ds4_gpu_tensor_view(g->batch.name, 0, \
@@ -43545,21 +43547,37 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[0][0]);
         float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
             engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
-        for (unsigned table = 0; ok && table < 2; table++)
+        /* A session's own rows load on its reader while the GPU runs the
+         * layers before each Engram upload. */
+        if (ok && disk_rows == s->rows && s->engram_reader)
+            ok = reading[i] = ds4_engram_reader_start(s->engram_reader, s->table, ids, &s->rows[0][0]);
+        for (unsigned table = 0; ok && !reading[i] && table < 2; table++)
             ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
         if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
     }
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
+    /* The second Engram upload uses the rows after the first one's, which
+     * the GPU may still be reading. */
+    const uint64_t engram_bytes = (uint64_t)rows * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * sizeof(float);
+    ds4_gpu_tensor *late_rows = ok ?
+        ds4_gpu_tensor_view(g->batch.engram_rows, engram_bytes, engram_bytes) : NULL;
+    ok = ok && late_rows;
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
         if (ds41_engram_layer(il)) {
             const unsigned table = il == 1 ? 0 : 1;
+            if (table) {
+                ds4_gpu_tensor *first = active.engram_rows;
+                active.engram_rows = late_rows;
+                late_rows = first;
+            }
             for (int i = 0; ok && i < count; i++) {
                 ds41_gpu_graph *s = graphs[i];
-                ok = ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0,
+                ok = (!reading[i] || ds4_engram_reader_wait(s->engram_reader, table)) &&
+                    ds4_gpu_tensor_write(g->rows_view[table * rows + i].engram_rows, 0,
                     engram && (uint32_t)i < prefill_rows ? engram[i][table] : s->rows[table],
                     sizeof(s->rows[table]));
             }
@@ -43619,9 +43637,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                 active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
             ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
-        /* The second Engram upload reuses the first one's input storage. */
-        if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
     }
+    /* Readers must finish before the sessions' host rows can be reused. */
+    for (int i = 0; i < count; i++)
+        if (reading[i] && !ds4_engram_reader_wait(graphs[i]->engram_reader, 1)) ok = false;
     const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float) /
                                   (g->tp_logits_half ? 2u : 1u);
     /* The final FFN intermediates are dead. Reuse that storage for the head
@@ -43660,6 +43679,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #define DS41_SESSION_FREE(name, width) ds4_gpu_tensor_free(active.name);
     DS41_PREFILL_ROWS(DS41_SESSION_FREE)
 #undef DS41_SESSION_FREE
+    ds4_gpu_tensor_free(late_rows);
     for (int i = 0; i < count; i++) {
         ds4_gpu_tensor_free(queries[i]);
         ds4_gpu_tensor_free(heads[i]);
