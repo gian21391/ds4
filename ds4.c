@@ -40974,6 +40974,7 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
  * the engine builds them once and every session graph borrows them. A NULL
  * entry keeps the original weight's path. */
 typedef struct {
+    ds4_gpu_tensor *engram_fp8[2], *engram_fp8_scale[2];
     ds4_gpu_tensor *router_bf16[40];
     bool ready;
 } ds41_repack;
@@ -41013,6 +41014,94 @@ typedef struct {
 } ds41_gpu_graph;
 
 #ifdef __APPLE__
+/* The released Engram projection is FP8 (e4m3) with power-of-two scales per
+ * 32x32 block; the GGUF stores its exact F16 dequantization. Recover the
+ * bytes and scales for decode, halving its weight reads. A block whose
+ * values are not exactly representable leaves the F16 path in place. */
+typedef struct {
+    const uint16_t *w;
+    uint8_t *q;
+    float *scales;
+    uint32_t width;
+    bool exact;
+} ds41_engram_fp8_job;
+
+static bool ds41_e4m3_encode(float v, uint8_t *out) {
+    const uint8_t sign = signbit(v) ? 0x80u : 0u;
+    const float a = fabsf(v);
+    int e;
+    if (a == 0) {
+        *out = sign;
+        return true;
+    }
+    frexpf(a, &e);
+    const bool normal = e - 1 >= -6;
+    const float mf = normal ? (ldexpf(a, 1 - e) - 1.0f) * 8.0f : ldexpf(a, 9);
+    const int mant = (int)mf;
+    if ((float)mant != mf || e - 1 > 8 || (e - 1 == 8 && mant == 7)) return false;
+    *out = sign | (uint8_t)(normal ? (e - 1 + 7) << 3 : 0) | (uint8_t)mant;
+    return true;
+}
+
+static void ds41_engram_fp8_rows(void *ctx, uint64_t b0, uint64_t b1) {
+    ds41_engram_fp8_job *job = ctx;
+    const uint32_t width = job->width;
+    for (uint64_t rb = b0; rb < b1 && __atomic_load_n(&job->exact, __ATOMIC_RELAXED); rb++) {
+        for (uint32_t cb = 0; cb < width / 32u; cb++) {
+            int top = INT_MIN;
+            for (uint64_t r = rb * 32u; r < rb * 32u + 32u; r++) {
+                for (uint32_t c = cb * 32u; c < cb * 32u + 32u; c++) {
+                    const float v = f16_to_f32(job->w[r * width + c]);
+                    int e;
+                    if (v != 0 && (frexpf(v, &e), e - 1 > top)) top = e - 1;
+                }
+            }
+            /* An all-zero block encodes under any scale. */
+            if (top == INT_MIN) top = 0;
+            /* 448 = 1.75 * 2^8 is the largest e4m3 value. */
+            bool ok = false;
+            int scale = 0;
+            for (int span = 8; !ok && span >= 7; span--) {
+                scale = top - span;
+                ok = true;
+                for (uint64_t r = rb * 32u; ok && r < rb * 32u + 32u; r++) {
+                    for (uint32_t c = cb * 32u; ok && c < cb * 32u + 32u; c++) {
+                        ok = ds41_e4m3_encode(ldexpf(f16_to_f32(job->w[r * width + c]), -scale),
+                                              &job->q[r * width + c]);
+                    }
+                }
+            }
+            if (!ok) {
+                __atomic_store_n(&job->exact, false, __ATOMIC_RELAXED);
+                return;
+            }
+            /* The kernel decodes e4m3 into a half, which carries 2^-8. */
+            job->scales[rb * (width / 32u) + cb] = ldexpf(1.0f, scale + 8);
+        }
+    }
+}
+
+static bool ds41_engram_fp8_pack(ds41_repack *r, const ds4_model *m,
+                                 const ds4_tensor *weight, uint32_t i) {
+    const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
+    if (weight->type != DS4_TENSOR_F16 || width % 32u || outputs % 32u) return true;
+    r->engram_fp8[i] = ds4_gpu_tensor_alloc((uint64_t)width * outputs);
+    r->engram_fp8_scale[i] = ds4_gpu_tensor_alloc((uint64_t)width / 32u * (outputs / 32u) * sizeof(float));
+    ds41_engram_fp8_job job = {
+        .w = tensor_data(m, weight), .width = width, .exact = true,
+        .q = r->engram_fp8[i] ? ds4_gpu_tensor_contents(r->engram_fp8[i]) : NULL,
+        .scales = r->engram_fp8_scale[i] ? ds4_gpu_tensor_contents(r->engram_fp8_scale[i]) : NULL,
+    };
+    if (!job.q || !job.scales) return false;
+    ds4_parallel_for_min_rows(outputs / 32u, ds41_engram_fp8_rows, &job, 1);
+    if (!job.exact) {
+        ds4_gpu_tensor_free(r->engram_fp8[i]);
+        ds4_gpu_tensor_free(r->engram_fp8_scale[i]);
+        r->engram_fp8[i] = r->engram_fp8_scale[i] = NULL;
+    }
+    return true;
+}
+
 /* The released router weights are BF16 values stored as F32. Keep their
  * BF16 halves for decode, halving the router reads; a weight with any low
  * mantissa bit set keeps the F32 path. */
@@ -41052,6 +41141,10 @@ static bool ds41_router_bf16_pack(ds41_repack *r, const ds4_model *m,
 #endif
 
 static void ds41_repack_free(ds41_repack *r) {
+    for (uint32_t i = 0; i < 2; i++) {
+        ds4_gpu_tensor_free(r->engram_fp8[i]);
+        ds4_gpu_tensor_free(r->engram_fp8_scale[i]);
+    }
     for (uint32_t i = 0; i < 40; i++) ds4_gpu_tensor_free(r->router_bf16[i]);
     memset(r, 0, sizeof(*r));
 }
@@ -41062,6 +41155,10 @@ static bool ds41_repack_build(ds41_repack *r, const ds4_model *m, const ds4_weig
 #ifdef __APPLE__
     bool ok = true;
     uint64_t bytes = 0;
+    for (uint32_t i = 0; ok && i < 2; i++) {
+        ok = ds41_engram_fp8_pack(r, m, w->layer[i ? 14u : 1u].engram_kv, i);
+        bytes += ds4_gpu_tensor_bytes(r->engram_fp8[i]) + ds4_gpu_tensor_bytes(r->engram_fp8_scale[i]);
+    }
     for (uint32_t il = 0; ok && il < 40; il++) {
         ok = ds41_router_bf16_pack(r, m, w->layer[il].ffn_gate_inp, il);
         bytes += ds4_gpu_tensor_bytes(r->router_bf16[il]);
@@ -41084,6 +41181,10 @@ static bool ds41_repack_build(ds41_repack *r, const ds4_model *m, const ds4_weig
 static uint64_t ds41_repack_bytes(const ds4_weights *w) {
     uint64_t bytes = 0;
 #ifdef __APPLE__
+    for (uint32_t i = 0; i < 2; i++) {
+        const ds4_tensor *t = w->layer[i ? 14u : 1u].engram_kv;
+        bytes += t->dim[0] * t->dim[1] + t->dim[0] / 32u * (t->dim[1] / 32u) * sizeof(float);
+    }
     for (uint32_t il = 0; il < 40; il++)
         if (w->layer[il].ffn_gate_inp->type == DS4_TENSOR_F32)
             bytes += (uint64_t)DS4_N_EMBD * DS4_N_EXPERT * sizeof(uint16_t);
@@ -41381,7 +41482,8 @@ static bool ds41_matmul_rows(ds4_gpu_tensor *out, const ds4_model *m,
     return ds41_matmul_rows_batch(out, m, weight, in, first, count, 1);
 }
 
-/* The router logits, from the engine's BF16 repack where it built one. */
+/* The router logits and the Engram projection, from the engine's repacks
+ * where it built one. */
 static bool ds41_router_logits(const ds41_gpu_graph *g, ds4_gpu_tensor *out, const ds4_model *m,
                                const ds4_layer_weights *l, uint32_t il,
                                const ds4_gpu_tensor *in, uint32_t count) {
@@ -41393,6 +41495,20 @@ static bool ds41_router_logits(const ds41_gpu_graph *g, ds4_gpu_tensor *out, con
     (void)g; (void)il;
 #endif
     return ds41_matmul_batch(out, m, l->ffn_gate_inp, in, count, false);
+}
+
+static bool ds41_engram_kv(const ds41_gpu_graph *g, ds4_gpu_tensor *out, const ds4_model *m,
+                           const ds4_layer_weights *l, uint32_t i,
+                           const ds4_gpu_tensor *rows, uint32_t count) {
+#ifdef __APPLE__
+    if (g->repack->engram_fp8[i] && count <= DS4_TP_BATCH_MAX_ROWS)
+        return ds4_gpu_dsv41_engram_kv_fp8(out, g->repack->engram_fp8[i],
+            g->repack->engram_fp8_scale[i], rows, (uint32_t)l->engram_kv->dim[0],
+            (uint32_t)l->engram_kv->dim[1], count);
+#else
+    (void)g; (void)i;
+#endif
+    return ds41_matmul_batch(out, m, l->engram_kv, rows, count, true);
 }
 
 static bool ds41_output_projection(ds41_gpu_graph *g, ds4_gpu_tensor *out,
@@ -41847,7 +41963,7 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        if (!ds41_matmul(g->engram_kv, m, l->engram_kv, g->engram_rows, true) ||
+        if (!ds41_engram_kv(g, g->engram_kv, m, l, i, g->engram_rows, 1) ||
             !ds4_gpu_dsv41_engram_add(g->residual, g->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return false;
@@ -41909,7 +42025,7 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          uint32_t il, uint32_t count) {
     if (ds41_engram_layer(il)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true) ||
+        if (!ds41_engram_kv(g, b->engram_kv, m, l, i, b->engram_rows, count) ||
             !ds4_gpu_dsv41_engram_add(b->residual, b->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], g->image_count ? g->image_text_mask : NULL,
                 DS4_N_EMBD, count, DS4_RMS_EPS))

@@ -84,7 +84,7 @@ static inline float4 dsv41_bf16(float4 x) {
     return as_type<float4>(bits & 0xffff0000u);
 }
 
-template<short NR0>
+template<short NR0, bool BF16 = false>
 static inline void helper_mv_reduce_and_write(
         device float * dst_f32,
         float sumf[NR0],
@@ -121,7 +121,7 @@ static inline void helper_mv_reduce_and_write(
         float tot = simd_sum(shmem_f32[row][tiisg]);
 
         if (tiisg == 0 && sgitg == 0) {
-            dst_f32[r0 + row] = tot;
+            dst_f32[r0 + row] = BF16 ? dsv41_bf16(tot) : tot;
         }
     }
 }

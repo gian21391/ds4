@@ -95,6 +95,12 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            const ds4_gpu_tensor *k_weight,
                            const ds4_gpu_tensor *mask,
                            uint32_t width, uint32_t rows, float eps);
+/* Engram KV projection, BF16-rounded, from the FP8 repack of its F16 weight
+ * (e4m3 bytes plus one power-of-two scale per 32x32 block); exactly equal to
+ * the F16 matvec followed by BF16 rounding, for each of rows inputs. */
+int ds4_gpu_dsv41_engram_kv_fp8(ds4_gpu_tensor *out, const ds4_gpu_tensor *weight,
+                               const ds4_gpu_tensor *scales, const ds4_gpu_tensor *x,
+                               uint32_t width, uint32_t outputs, uint32_t rows);
 /* Router logits from the BF16 repack of the F32 router weight; exactly equal
  * to the F32 matvec. */
 int ds4_gpu_dsv41_router_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *weight,

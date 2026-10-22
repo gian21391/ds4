@@ -48118,6 +48118,25 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
     }
 }
 
+int ds4_gpu_dsv41_engram_kv_fp8(ds4_gpu_tensor *out, const ds4_gpu_tensor *weight,
+                               const ds4_gpu_tensor *scales, const ds4_gpu_tensor *x,
+                               uint32_t width, uint32_t outputs, uint32_t rows) {
+    if (!width || width % 512u || outputs % 32u || !rows ||
+        !dsv41_tensor_has_floats(out, (uint64_t)outputs * rows) ||
+        !dsv41_tensor_has_floats(x, (uint64_t)width * rows) ||
+        ds4_gpu_tensor_bytes(weight) < (uint64_t)width * outputs ||
+        !dsv41_tensor_has_floats(scales, (uint64_t)width / 32u * (outputs / 32u))) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        const uint32_t dims[4] = {width, outputs, rows, 0};
+        const dsv41_bind binds[] = {dsv41_bytes(dims, sizeof(dims)), dsv41_tensor(weight),
+            dsv41_tensor(scales), dsv41_tensor(x), dsv41_tensor(out)};
+        return dsv41_dispatch(ds4_gpu_get_pipeline("kernel_dsv41_engram_kv_fp8"), binds, 5,
+            32u * 2u * sizeof(float), MTLSizeMake(outputs / 2u, (rows + 3u) / 4u, 1),
+            MTLSizeMake(32, 8, 1), "V4.1 Engram FP8 projection");
+    }
+}
+
 int ds4_gpu_dsv41_router_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *weight,
                              const ds4_gpu_tensor *x, uint32_t width, uint32_t outputs,
                              uint32_t rows) {
