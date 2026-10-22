@@ -41716,12 +41716,13 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
         if (il == 20) {
             const uint32_t blocks = (n_comp + 7u) / 8u, top = blocks < 2048u ? blocks : 2048u;
             /* Below the block cap every block survives. Their sorted order
-             * is unused; only the mask is consumed by subsequent layers. */
+             * is unused; only the mask is consumed by subsequent layers,
+             * which skip the filter while the mask keeps every block. */
             if (top == blocks) return ds4_gpu_tensor_fill_f32(g->block_mask, 0, blocks) != 0;
             if (!ds4_gpu_dsv41_candidate_blocks(g->block_scores, g->index_scores, n_comp, 1, pos, ratio) ||
                 !ds4_gpu_indexer_topk_tensor(g->block_selected, g->block_scores, blocks, 1, top) ||
                 !ds4_gpu_dsv4_topk_mask_tensor(g->block_mask, g->block_selected, blocks, 1, top)) return false;
-        } else if (il > 20 &&
+        } else if (il > 20 && (n_comp + 7u) / 8u > 2048u &&
             !ds4_gpu_dsv41_candidate_filter(g->index_scores, g->block_mask, n_comp, 1, pos, ratio)) return false;
     }
     return true;
