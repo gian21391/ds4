@@ -5933,14 +5933,14 @@ kernel void kernel_mul_mv_id_q2_K_sum6_f32(
     const short ir = it%4;
     const short is = (8*ir)/16;
 
-    for (int expert_slot = 0; expert_slot < args.nei0; expert_slot++) {
+    for (int u = ix; u < args.nei0 * nb; u += 4) {
+        const int expert_slot = u / nb;
+        const int ib = u - expert_slot * nb;
         const int32_t expert = token_ids[expert_slot];
         if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
         device const block_q2_K * x = (device const block_q2_K *)(src0s + (int64_t)(expert - args.tp_expert_base)*args.nb02 + first_row*args.nb01);
-        device const float * y = (device const float *)(token_src1 + expert_slot*args.nb11);
-        device const float * y4 = y + ix * QK_K + 128 * iq + 8 * ir;
-
-        for (int ib = ix; ib < nb; ib += 4) {
+        device const float * y4 = (device const float *)(token_src1 + expert_slot*args.nb11) + ib * QK_K + 128 * iq + 8 * ir;
+        {
             float yl[32];
             float4 sumy = {0.f, 0.f, 0.f, 0.f};
             for (short i = 0; i < 8; ++i) {
@@ -5959,14 +5959,14 @@ kernel void kernel_mul_mv_id_q2_K_sum6_f32(
                     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
                     for (int i = 0; i < 8; i += 2) {
-                        acc1[0] += yl[i+ 0] * (qs[i/2] & 0x0003);
-                        acc2[0] += yl[i+ 1] * (qs[i/2] & 0x0300);
-                        acc1[1] += yl[i+ 8] * (qs[i/2] & 0x000c);
-                        acc2[1] += yl[i+ 9] * (qs[i/2] & 0x0c00);
-                        acc1[2] += yl[i+16] * (qs[i/2] & 0x0030);
-                        acc2[2] += yl[i+17] * (qs[i/2] & 0x3000);
-                        acc1[3] += yl[i+24] * (qs[i/2] & 0x00c0);
-                        acc2[3] += yl[i+25] * (qs[i/2] & 0xc000);
+                        acc1[0] += yl[i+ 0] * ds4_small_uint_to_f32(qs[i/2] & 0x0003);
+                        acc2[0] += yl[i+ 1] * ds4_small_uint_to_f32(qs[i/2] & 0x0300);
+                        acc1[1] += yl[i+ 8] * ds4_small_uint_to_f32(qs[i/2] & 0x000c);
+                        acc2[1] += yl[i+ 9] * ds4_small_uint_to_f32(qs[i/2] & 0x0c00);
+                        acc1[2] += yl[i+16] * ds4_small_uint_to_f32(qs[i/2] & 0x0030);
+                        acc2[2] += yl[i+17] * ds4_small_uint_to_f32(qs[i/2] & 0x3000);
+                        acc1[3] += yl[i+24] * ds4_small_uint_to_f32(qs[i/2] & 0x00c0);
+                        acc2[3] += yl[i+25] * ds4_small_uint_to_f32(qs[i/2] & 0xc000);
                     }
                     float dall = dh[0];
                     float dmin = dh[1] * 1.f/16.f;
@@ -5982,8 +5982,6 @@ kernel void kernel_mul_mv_id_q2_K_sum6_f32(
                 sc += args.nb01;
                 dh += args.nb01/2;
             }
-
-            y4 += 4 * QK_K;
         }
     }
 

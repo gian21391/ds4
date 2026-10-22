@@ -7736,9 +7736,14 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        /* Four SIMD groups per threadgroup: each keeps its own rows, so only
+         * the threadgroup count changes. */
+        MTLFunctionConstantValues *moe_sum6_constants = [[MTLFunctionConstantValues alloc] init];
+        int16_t moe_sum6_nsg = 4;
+        [moe_sum6_constants setConstantValue:&moe_sum6_nsg type:MTLDataTypeShort atIndex:600];
         error = nil;
         fn = [library newFunctionWithName:@"kernel_mul_mv_id_q2_K_sum6_f32"
-                           constantValues:moe_mv_id_constants
+                           constantValues:moe_sum6_constants
                                     error:&error];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q2_K_sum6_f32 function not found: %s\n",
@@ -40698,6 +40703,7 @@ int ds4_gpu_routed_moe_one_tensor(
         id<MTLComputePipelineState> down_sum6_pipeline = nil;
         if (down_type == DS4_METAL_TENSOR_Q2_K) {
             down_sum6_pipeline = g_moe_mul_mv_id_q2_k_sum6_pipeline;
+            down_sum6_nsg = 4;
         } else if (down_type == DS4_METAL_TENSOR_Q4_K) {
             down_sum6_pipeline = g_moe_mul_mv_id_q4_k_sum6_pipeline;
         } else if (down_type == DS4_METAL_TENSOR_MXFP4) {
@@ -44407,7 +44413,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                      nil,
                                                      0,
                                                      down_smem,
-                                                     use_tp_mxfp4_static_batch ? 1 : 2);
+                                                     use_tp_mxfp4_static_batch ? 1 :
+                                                     down_type == DS4_METAL_TENSOR_Q2_K ? 4 : 2);
             } else if (use_mm_id) {
                 if (use_packed_mpp)
                     ok = ds4_gpu_encode_moe_packed_rhs(cb, &down_mm_args,
