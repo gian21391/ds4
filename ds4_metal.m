@@ -22522,6 +22522,44 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
     return 1;
 }
 
+/* One V4.1 dispatch in the current command batch: each binding is a buffer
+ * range or inline bytes, at consecutive indices from 0. */
+typedef struct {
+    id<MTLBuffer> buf;
+    NSUInteger    off;
+    const void   *bytes;
+    NSUInteger    len;
+} dsv41_bind;
+
+static dsv41_bind dsv41_tensor(const ds4_gpu_tensor *t) {
+    return (dsv41_bind){ds4_gpu_tensor_buffer(t), ds4_gpu_tensor_offset(t), NULL, 0};
+}
+
+static dsv41_bind dsv41_bytes(const void *bytes, NSUInteger len) {
+    return (dsv41_bind){nil, 0, bytes, len};
+}
+
+static int dsv41_dispatch(id<MTLComputePipelineState> pipeline, const dsv41_bind *binds,
+                          NSUInteger n, NSUInteger tg_mem, MTLSize grid, MTLSize tg,
+                          const char *label) {
+    if (!pipeline) return 0;
+    for (NSUInteger i = 0; i < n; i++)
+        if (!binds[i].buf && !binds[i].bytes) return 0;
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    for (NSUInteger i = 0; i < n; i++) {
+        if (binds[i].bytes) [enc setBytes:binds[i].bytes length:binds[i].len atIndex:i];
+        else [enc setBuffer:binds[i].buf offset:binds[i].off atIndex:i];
+    }
+    if (tg_mem) [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
+    [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, label);
+}
+
 int ds4_gpu_add_rms_norm_weight_tensor(
         ds4_gpu_tensor       *norm_out,
         ds4_gpu_tensor       *sum_out,
@@ -48077,6 +48115,31 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 Engram gate");
+    }
+}
+
+int ds4_gpu_dsv41_router_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *weight,
+                             const ds4_gpu_tensor *x, uint32_t width, uint32_t outputs,
+                             uint32_t rows) {
+    if (!width || width % 4u || !rows ||
+        !dsv41_tensor_has_floats(out, (uint64_t)outputs * rows) ||
+        !dsv41_tensor_has_floats(x, (uint64_t)width * rows) ||
+        ds4_gpu_tensor_bytes(weight) < (uint64_t)width * outputs * 2u) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_f32_mv_args(width, outputs, rows);
+        args.nb00 = 2;
+        args.nb01 = (uint64_t)width * 2u;
+        args.nb02 = args.nb03 = args.nb01 * outputs;
+        args.nr0 = 1;
+        const dsv41_bind binds[] = {dsv41_bytes(&args, sizeof(args)), dsv41_tensor(weight),
+            dsv41_tensor(x), dsv41_tensor(out)};
+        /* Same one-row, eight-simdgroup walk as the F32 router matvec; a
+         * batch reads the weights once for up to four rows. */
+        return dsv41_dispatch(ds4_gpu_get_mul_mv_pipeline(rows > 1 ?
+            "kernel_mul_mv_bf16_f32_4_rows4" : "kernel_mul_mv_bf16_f32_4", 8), binds, 4,
+            32u * sizeof(float), MTLSizeMake(outputs, (rows + 3u) / 4u, 1),
+            MTLSizeMake(32, 8, 1), "V4.1 BF16 router matvec");
     }
 }
 

@@ -40970,6 +40970,14 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(engram_prefetch, (g->carry_cap ? g->carry_cap : g->prefill_cap) * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD) X(logits, DS4_N_VOCAB)
 
+/* Metal decode repacks of model weights. They depend only on the weights, so
+ * the engine builds them once and every session graph borrows them. A NULL
+ * entry keeps the original weight's path. */
+typedef struct {
+    ds4_gpu_tensor *router_bf16[40];
+    bool ready;
+} ds41_repack;
+
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
     uint64_t allocation_bytes;
@@ -40994,6 +41002,7 @@ typedef struct {
     ds4_gpu_tensor *verify_previous_kv[4], *verify_previous_score[4];
     bool verify_prefix;
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
+    const ds41_repack *repack;
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
@@ -41002,6 +41011,87 @@ typedef struct {
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
 } ds41_gpu_graph;
+
+#ifdef __APPLE__
+/* The released router weights are BF16 values stored as F32. Keep their
+ * BF16 halves for decode, halving the router reads; a weight with any low
+ * mantissa bit set keeps the F32 path. */
+typedef struct {
+    const uint32_t *w;
+    uint16_t *out;
+    bool exact;
+} ds41_router_bf16_job;
+
+static void ds41_router_bf16_rows(void *ctx, uint64_t r0, uint64_t r1) {
+    ds41_router_bf16_job *job = ctx;
+    for (uint64_t i = r0 * DS4_N_EMBD; i < r1 * DS4_N_EMBD; i++) {
+        if (job->w[i] & 0xffffu) {
+            __atomic_store_n(&job->exact, false, __ATOMIC_RELAXED);
+            return;
+        }
+        job->out[i] = (uint16_t)(job->w[i] >> 16);
+    }
+}
+
+static bool ds41_router_bf16_pack(ds41_repack *r, const ds4_model *m,
+                                  const ds4_tensor *weight, uint32_t il) {
+    if (weight->type != DS4_TENSOR_F32) return true;
+    r->router_bf16[il] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * DS4_N_EXPERT * sizeof(uint16_t));
+    ds41_router_bf16_job job = {
+        .w = tensor_data(m, weight), .exact = true,
+        .out = r->router_bf16[il] ? ds4_gpu_tensor_contents(r->router_bf16[il]) : NULL,
+    };
+    if (!job.out) return false;
+    ds4_parallel_for_min_rows(DS4_N_EXPERT, ds41_router_bf16_rows, &job, 1);
+    if (!job.exact) {
+        ds4_gpu_tensor_free(r->router_bf16[il]);
+        r->router_bf16[il] = NULL;
+    }
+    return true;
+}
+#endif
+
+static void ds41_repack_free(ds41_repack *r) {
+    for (uint32_t i = 0; i < 40; i++) ds4_gpu_tensor_free(r->router_bf16[i]);
+    memset(r, 0, sizeof(*r));
+}
+
+/* Built by the first session graph; later graphs reuse it. */
+static bool ds41_repack_build(ds41_repack *r, const ds4_model *m, const ds4_weights *w) {
+    if (r->ready) return true;
+#ifdef __APPLE__
+    bool ok = true;
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; ok && il < 40; il++) {
+        ok = ds41_router_bf16_pack(r, m, w->layer[il].ffn_gate_inp, il);
+        bytes += ds4_gpu_tensor_bytes(r->router_bf16[il]);
+    }
+    if (!ok) {
+        ds41_repack_free(r);
+        return false;
+    }
+    fprintf(stderr, "ds4: V4.1 decode weight repacks %.2f MiB, shared by all sessions\n",
+            (double)bytes / 1048576.0);
+#else
+    (void)m;
+    (void)w;
+#endif
+    r->ready = true;
+    return true;
+}
+
+/* Upper bound of ds41_repack_build's allocations, for memory admission. */
+static uint64_t ds41_repack_bytes(const ds4_weights *w) {
+    uint64_t bytes = 0;
+#ifdef __APPLE__
+    for (uint32_t il = 0; il < 40; il++)
+        if (w->layer[il].ffn_gate_inp->type == DS4_TENSOR_F32)
+            bytes += (uint64_t)DS4_N_EMBD * DS4_N_EXPERT * sizeof(uint16_t);
+#else
+    (void)w;
+#endif
+    return bytes;
+}
 
 static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
                             uint64_t count, void *out, size_t bytes) {
@@ -41108,8 +41198,8 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
 }
 
 static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model *m,
-                                              const ds4_weights *w, const char *path,
-                                              uint32_t ctx, bool streaming) {
+                                              const ds4_weights *w, ds41_repack *repack,
+                                              const char *path, uint32_t ctx, bool streaming) {
     memset(g, 0, sizeof(*g));
     g->table[0].fd = g->table[1].fd = -1;
     if (!ctx || ctx > 1048576 || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) return false;
@@ -41121,6 +41211,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     g->allocation_bytes = ds41_graph_bytes(ctx);
     g->streaming = streaming;
     g->tp_world = 1;
+    if (!ds41_repack_build(repack, m, w)) goto fail;
+    g->repack = repack;
     g->token_map = malloc((size_t)DS4_N_VOCAB * sizeof(uint32_t));
     g->prefill_ids = malloc((size_t)(g->carry_cap ? g->carry_cap : g->prefill_cap) *
                             sizeof(*g->prefill_ids));
@@ -41287,6 +41379,20 @@ static bool ds41_matmul_rows(ds4_gpu_tensor *out, const ds4_model *m,
                              const ds4_tensor *weight, const ds4_gpu_tensor *in,
                              uint32_t first, uint32_t count) {
     return ds41_matmul_rows_batch(out, m, weight, in, first, count, 1);
+}
+
+/* The router logits, from the engine's BF16 repack where it built one. */
+static bool ds41_router_logits(const ds41_gpu_graph *g, ds4_gpu_tensor *out, const ds4_model *m,
+                               const ds4_layer_weights *l, uint32_t il,
+                               const ds4_gpu_tensor *in, uint32_t count) {
+#ifdef __APPLE__
+    if (g->repack->router_bf16[il] && count <= DS4_TP_BATCH_MAX_ROWS)
+        return ds4_gpu_dsv41_router_bf16(out, g->repack->router_bf16[il], in,
+                                         DS4_N_EMBD, DS4_N_EXPERT, count);
+#else
+    (void)g; (void)il;
+#endif
+    return ds41_matmul_batch(out, m, l->ffn_gate_inp, in, count, false);
 }
 
 static bool ds41_output_projection(ds41_gpu_graph *g, ds4_gpu_tensor *out,
@@ -41612,7 +41718,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
-    if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
+    if (!ds41_router_logits(g, g->route_logits, m, l, il, g->norm, 1) ||
         !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
@@ -42135,7 +42241,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     const bool balance_shared = shared_owner && ds41_balance_shared(g, l, count);
     bool mid_f16 = false;
-    return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
+    return ds41_router_logits(g, b->route_logits, m, l, il, b->norm, count) &&
         ds41_route_batch(g, m, l, count) &&
         ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
@@ -43204,6 +43310,9 @@ typedef enum {
 struct ds4_engine {
     char *model_path;
     uint64_t ds41_session_bytes;
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    ds41_repack ds41_repack;
+#endif
     ds4_model model;
     ds4_model mtp_model;
     ds4_model vision_model;
@@ -65118,7 +65227,7 @@ static int ds4_engine_collect_sequential_imatrix(
         if (ctx_size > 1048576 ||
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
                 ds41_graph_bytes((uint32_t)ctx_size)), false) ||
-            !ds41_graph_alloc(&d, &e->model, &e->weights, e->model_path,
+            !ds41_graph_alloc(&d, &e->model, &e->weights, &e->ds41_repack, e->model_path,
                               (uint32_t)ctx_size, e->ssd_streaming)) return 1;
     } else
 #endif
@@ -71701,6 +71810,7 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
     weights = ds4_add_sat_u64(weights, e->vision_model.size);
     weights = ds4_add_sat_u64(weights, e->mtp_model.size);
+    weights = ds4_add_sat_u64(weights, ds41_repack_bytes(&e->weights));
     if (e->dspark) graph_bytes = ds4_add_sat_u64(graph_bytes,
         ds4_mul_sat_u64(UINT64_C(64) << 20, engine_placement_session_count(e)));
     const uint64_t fixed = ds4_add_sat_u64(weights,
@@ -74113,6 +74223,9 @@ void ds4_engine_close(ds4_engine *e) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
     }
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    ds41_repack_free(&e->ds41_repack);
+#endif
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
@@ -74305,7 +74418,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
                 ds41_graph_bytes((uint32_t)ctx_size)), false) ||
             !ds41_graph_alloc(&s->ds41_graph, &e->model, &e->weights,
-                              e->model_path, (uint32_t)ctx_size, e->ssd_streaming)) {
+                              &e->ds41_repack, e->model_path, (uint32_t)ctx_size, e->ssd_streaming)) {
             free(s);
             return 1;
         }

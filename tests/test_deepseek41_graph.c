@@ -1491,6 +1491,7 @@ static int check_partitions(const char *path) {
     ds4_model model = {.fd = -1};
     ds4_weights weights = {0};
     ds41_gpu_graph g = {.table = {{.fd = -1}, {.fd = -1}}};
+    ds41_repack repack = {0};
     ds4_model_map_span_vec spans = {0};
     uint64_t *offsets = NULL, *sizes = NULL;
     float *expected = NULL, *actual = NULL, *first = NULL;
@@ -1505,7 +1506,7 @@ static int check_partitions(const char *path) {
     ds4_gpu_set_streaming_expert_cache_budget(16);
     setenv("DS4_TP_NO_KEEPALIVE", "1", 1);
     REQUIRE(ds4_gpu_set_model_fd(model.fd));
-    REQUIRE(ds41_graph_alloc(&g, &model, &weights, path, 1, true));
+    REQUIRE(ds41_graph_alloc(&g, &model, &weights, &repack, path, 1, true));
     const size_t bytes = DS4_N_EMBD * sizeof(float);
     const size_t head_bytes = DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
     expected = malloc(head_bytes); actual = malloc(head_bytes); first = malloc(head_bytes);
@@ -1613,7 +1614,7 @@ static int check_partitions(const char *path) {
 done:
     if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
     ds4_gpu_tp_shutdown();
-    ds41_graph_free(&g); ds4_gpu_cleanup(); model_close(&model);
+    ds41_graph_free(&g); ds41_repack_free(&repack); ds4_gpu_cleanup(); model_close(&model);
     free(spans.v); free(offsets); free(sizes);
     free(expected); free(actual); free(first);
     return rc;
@@ -1993,6 +1994,7 @@ int main(int argc, char **argv) {
     ds4_weights weights = {0};
     ds4_vocab vocab = {0};
     ds41_gpu_graph graph = {.table = {{.fd = -1}, {.fd = -1}}};
+    ds41_repack repack = {0};
     token_vec prompt = {0};
     float *logits = NULL;
     ds4_model_map_span_vec spans = {0};
@@ -2032,7 +2034,7 @@ int main(int argc, char **argv) {
     }
     REQUIRE(ds4_gpu_set_model_map_spans(model.map, model.size, offsets, sizes,
                                        spans.len, spans.max_tensor_bytes));
-    REQUIRE(ds41_graph_alloc(&graph, &model, &weights, argv[1], zero ? 20000 : 4096, true));
+    REQUIRE(ds41_graph_alloc(&graph, &model, &weights, &repack, argv[1], zero ? 20000 : 4096, true));
     logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     REQUIRE(logits);
     const double start = now_sec();
@@ -2078,6 +2080,7 @@ int main(int argc, char **argv) {
 done:
     if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
     ds41_graph_free(&graph);
+    ds41_repack_free(&repack);
     ds4_gpu_cleanup();
     vocab_free(&vocab);
     token_vec_free(&prompt);

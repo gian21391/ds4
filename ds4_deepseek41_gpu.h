@@ -95,6 +95,11 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            const ds4_gpu_tensor *k_weight,
                            const ds4_gpu_tensor *mask,
                            uint32_t width, uint32_t rows, float eps);
+/* Router logits from the BF16 repack of the F32 router weight; exactly equal
+ * to the F32 matvec. */
+int ds4_gpu_dsv41_router_bf16(ds4_gpu_tensor *out, const ds4_gpu_tensor *weight,
+                             const ds4_gpu_tensor *x, uint32_t width, uint32_t outputs,
+                             uint32_t rows);
 /* Pool complete pairs and retain the last unpaired projection in previous_*.
  * start is the absolute token position, including earlier chunks. */
 int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,
