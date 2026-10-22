@@ -42669,17 +42669,60 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+static bool ds41_routed_batch(ds41_gpu_graph *g, const ds4_model *m,
+                              const ds4_layer_weights *l, uint32_t il, uint32_t count,
+                              bool *mid_f16) {
+    ds41_prefill_row *b = &g->batch;
+    const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
+    const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
+    return ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+        m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+        l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+        gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+        DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
+        DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
+        il, count, mid_f16, !g->verify_prefix);
+}
+
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
                            bool shared_owner) {
     ds41_prefill_row *b = &g->batch;
+#ifndef __APPLE__
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
+#endif
     const bool balance_shared = shared_owner && ds41_balance_shared(g, l, count);
     bool mid_f16 = false;
-    return ds41_router_logits(g, b->route_logits, m, l, il, b->norm, count) &&
-        ds41_route_batch(g, m, l, count) &&
-        ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
+    if (!ds41_router_logits(g, b->route_logits, m, l, il, b->norm, count) ||
+        !ds41_route_batch(g, m, l, count)) return false;
+#ifdef __APPLE__
+    /* One device: the shared expert runs beside the routed experts. Its
+     * gate/up share the first level with the routed pair-SwiGLU and its
+     * rounding the second with the routed down projection, which the routed
+     * call opens with a barrier; the rest follows in levels of its own. */
+    if (g->tp_world < 2 &&
+        ds4_gpu_dsv41_routed_fused(l->ffn_gate_exps->type, l->ffn_down_exps->type, count)) {
+        const bool levels = ds4_gpu_concurrent_begin() != 0;
+        bool ok = ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, false) &&
+            ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, false) &&
+            ds41_routed_batch(g, m, l, il, count, &mid_f16) &&
+            ds4_gpu_dsv41_quantize(b->shared_gate, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
+            ds4_gpu_dsv41_quantize(b->shared_up, DS4_N_FF_EXP, count, DS4_V41_BF16);
+        ds4_gpu_concurrent_barrier();
+        ok = ok && ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+            count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f);
+        ds4_gpu_concurrent_barrier();
+        ok = ok && ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16);
+        ds4_gpu_concurrent_barrier();
+        ok = ok && ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, false);
+        ds4_gpu_concurrent_barrier();
+        ok = ok && ds4_gpu_dsv41_quantize(b->shared, DS4_N_EMBD, count, DS4_V41_BF16);
+        if (levels) ds4_gpu_concurrent_end();
+        return ok && ds41_sum_partial_batch(g, b->routed, il, DS4_TP_GATE_FFN, count);
+    }
+#endif
+    return ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
         ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
         ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
@@ -42701,13 +42744,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank * (DS4_N_EXPERT / 2u),
             DS4_N_EXPERT / 2u, DS4_SWIGLU_CLAMP_EXP, b->norm, il, count, &mid_f16) :
 #endif
-        ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
-            m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
-            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
-            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
-            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
-            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
-            il, count, &mid_f16, !g->verify_prefix)) &&
+        ds41_routed_batch(g, m, l, il, count, &mid_f16)) &&
         (!shared_owner || (!balance_shared && g->tp_rank != (il & 1u)) ||
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
         ds41_sum_partial_batch(g, b->routed, il, DS4_TP_GATE_FFN, count);
@@ -43666,14 +43703,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                     l->attn_output_b->abs_offset, g->batch.heads, rows);
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows);
 #ifdef __APPLE__
-        /* The Metal BF16 HC expands round the block on load. */
+        /* The Metal BF16 HC expands round the block on load; on one device
+         * the post-FFN one also adds the shared expert (ds41_graph_after_moe). */
         if (ok) ok = ds41_after_attention_rows(g, &active, model, l, rows) &&
             ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
-            (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
-                (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
-                ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
-            ds4_gpu_dsv41_hc_expand(active.residual, active.block, active.after_attn,
-                active.ffn_split, DS4_N_EMBD, rows);
+            (g->tp_world < 2 ?
+             ds4_gpu_dsv41_hc_expand_add(active.residual, active.routed, active.shared,
+                 active.after_attn, active.ffn_split, DS4_N_EMBD, rows) :
+             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
+                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
+                 ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
+             ds4_gpu_dsv41_hc_expand(active.residual, active.block, active.after_attn,
+                 active.ffn_split, DS4_N_EMBD, rows));
 #else
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows) &&

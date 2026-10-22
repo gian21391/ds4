@@ -44747,6 +44747,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                ds4_gpu_tensor_offset(mid));
         }
         DS4_METAL_PROFILE_MOE_STAGE("activation_weight");
+        /* A caller's concurrent section ends the activation level here. */
+        ds4_gpu_concurrent_barrier();
 
         id<MTLBuffer> down_dst = n_expert == 1 ? outbuf : (expertsbuf ? expertsbuf : g_moe_down_scratch_buffer);
         NSUInteger down_dst_off = n_expert == 1 ? ds4_gpu_tensor_offset(out) :
