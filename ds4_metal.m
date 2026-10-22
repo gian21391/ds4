@@ -22637,6 +22637,63 @@ int ds4_gpu_dsv41_hc_expand_sum_norm(ds4_gpu_tensor *out_hc, ds4_gpu_tensor *pre
     }
 }
 
+typedef struct {
+    int32_t n;
+    int32_t n_splits;
+    int32_t sinkhorn_iters;
+    float   eps;
+    float   hc_eps;
+} ds4_gpu_dsv41_hc_mix_args;
+
+#define DS4_GPU_HC_MIX_SPLITS 64u
+
+int ds4_gpu_dsv41_hc_mix_partial(ds4_gpu_tensor *part, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t offset, uint32_t width) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint64_t weight_bytes = (uint64_t)width * 24u * sizeof(uint16_t);
+    if (!part || !x || width % (4u * DS4_GPU_HC_MIX_SPLITS) != 0 ||
+        ds4_gpu_tensor_bytes(x) < (uint64_t)width * sizeof(float) ||
+        ds4_gpu_tensor_bytes(part) < DS4_GPU_HC_MIX_SPLITS * 25u * sizeof(float) ||
+        offset > size || weight_bytes > size - offset) return 0;
+
+    @autoreleasepool {
+        const ds4_gpu_dsv41_hc_mix_args args = {
+            .n = (int32_t)width,
+            .n_splits = DS4_GPU_HC_MIX_SPLITS,
+        };
+        const dsv41_bind binds[] = {dsv41_bytes(&args, sizeof(args)), dsv41_tensor(x),
+            dsv41_model(map, size, offset, weight_bytes), dsv41_tensor(part)};
+        return dsv41_dispatch(ds4_gpu_get_pipeline("kernel_dsv41_hc_mix_partial_f16"),
+            binds, 4, 0, MTLSizeMake(DS4_GPU_HC_MIX_SPLITS, 1, 1), MTLSizeMake(32, 8, 1),
+            "V4.1 HC mix partial");
+    }
+}
+
+int ds4_gpu_dsv41_hc_mix_split(ds4_gpu_tensor *out, const ds4_gpu_tensor *part,
+        const void *map, uint64_t size, uint64_t scale_offset, uint64_t base_offset,
+        uint32_t width, uint32_t sinkhorn_iters, float eps, float hc_eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !part || ds4_gpu_tensor_bytes(out) < 24u * sizeof(float) ||
+        ds4_gpu_tensor_bytes(part) < DS4_GPU_HC_MIX_SPLITS * 25u * sizeof(float) ||
+        scale_offset > size || 3u * sizeof(float) > size - scale_offset ||
+        base_offset > size || 24u * sizeof(float) > size - base_offset) return 0;
+
+    @autoreleasepool {
+        const ds4_gpu_dsv41_hc_mix_args args = {
+            .n = (int32_t)width,
+            .n_splits = DS4_GPU_HC_MIX_SPLITS,
+            .sinkhorn_iters = (int32_t)sinkhorn_iters,
+            .eps = eps,
+            .hc_eps = hc_eps,
+        };
+        const dsv41_bind binds[] = {dsv41_bytes(&args, sizeof(args)), dsv41_tensor(part),
+            dsv41_model(map, size, scale_offset, 3u * sizeof(float)),
+            dsv41_model(map, size, base_offset, 24u * sizeof(float)), dsv41_tensor(out)};
+        return dsv41_dispatch(ds4_gpu_get_pipeline("kernel_dsv41_hc_mix_split"),
+            binds, 5, 0, MTLSizeMake(1, 1, 1), MTLSizeMake(32, 1, 1), "V4.1 HC mix split");
+    }
+}
+
 int ds4_gpu_add_rms_norm_weight_tensor(
         ds4_gpu_tensor       *norm_out,
         ds4_gpu_tensor       *sum_out,

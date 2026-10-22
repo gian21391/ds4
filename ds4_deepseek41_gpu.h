@@ -92,6 +92,14 @@ int ds4_gpu_dsv41_attention_output_low(
         ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
         uint32_t n_groups, const ds4_gpu_tensor *heads);
+/* The decode HC mix as DeepSeek computes it: split-K partials of x.fn (F16 fn,
+ * 24 rows) and of sum(x^2), then their reduction with the RMS scale applied
+ * after the projection and the HC split. part holds 64 x 25 floats. */
+int ds4_gpu_dsv41_hc_mix_partial(ds4_gpu_tensor *part, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t offset, uint32_t width);
+int ds4_gpu_dsv41_hc_mix_split(ds4_gpu_tensor *out, const ds4_gpu_tensor *part,
+        const void *map, uint64_t size, uint64_t scale_offset, uint64_t base_offset,
+        uint32_t width, uint32_t sinkhorn_iters, float eps, float hc_eps);
 #endif
 /* Full-head prefill, with BF16 rounding between the two Q8 projections. */
 int ds4_gpu_dsv41_attention_output_batch(

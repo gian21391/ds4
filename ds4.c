@@ -41645,18 +41645,36 @@ static bool ds41_rope(ds4_gpu_tensor *x, uint32_t heads, uint32_t width,
                               ds4_layer_compress_ratio(il) != 0, inverse);
 }
 
-static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
-                        const ds4_layer_weights *l, bool ffn) {
-    const ds4_gpu_tensor *residual = ffn ? g->after_attn : g->residual;
-    const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
+/* One of the HC mix's dependent kernels. Metal has two: the split-K x.fn and
+ * sum(x^2) partials (in flat_norm), then their reduction, the RMS scale and
+ * the split. */
+static bool ds41_hc_mix_stage(ds41_gpu_graph *g, const ds4_model *m,
+                              const ds4_layer_weights *l, bool ffn, int stage) {
     const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
     const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
-    return ds4_gpu_rms_norm_plain_tensor(g->flat_norm, residual,
-               DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS) &&
-           ds41_matmul(g->mix, m, fn, g->flat_norm, false) &&
-           ds4_gpu_hc_split_sinkhorn_tensor(ffn ? g->ffn_split : g->attn_split,
+#ifdef __APPLE__
+    if (stage == 0)
+        return ds4_gpu_dsv41_hc_mix_partial(g->flat_norm, ffn ? g->after_attn : g->residual,
+            m->map, m->size, (ffn ? l->hc_ffn_fn : l->hc_attn_fn)->abs_offset,
+            DS4_N_HC * DS4_N_EMBD);
+    return ds4_gpu_dsv41_hc_mix_split(ffn ? g->ffn_split : g->attn_split, g->flat_norm,
+        m->map, m->size, scale->abs_offset, base->abs_offset, DS4_N_HC * DS4_N_EMBD,
+        DS4_N_HC_SINKHORN_ITER, DS4_RMS_EPS, DS4_HC_EPS);
+#else
+    if (stage == 0)
+        return ds4_gpu_rms_norm_plain_tensor(g->flat_norm, ffn ? g->after_attn : g->residual,
+                                             DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS);
+    if (stage == 1) return ds41_matmul(g->mix, m, ffn ? l->hc_ffn_fn : l->hc_attn_fn, g->flat_norm, false);
+    return ds4_gpu_hc_split_sinkhorn_tensor(ffn ? g->ffn_split : g->attn_split,
                g->mix, m->map, m->size, scale->abs_offset, base->abs_offset,
                DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
+#endif
+}
+
+static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
+                        const ds4_layer_weights *l, bool ffn) {
+    return ds41_hc_mix_stage(g, m, l, ffn, 0) && ds41_hc_mix_stage(g, m, l, ffn, 1) &&
+           (DS41_METAL || ds41_hc_mix_stage(g, m, l, ffn, 2));
 }
 
 /* The HC sum and the norm of the sum; one kernel on Metal. */
@@ -42045,6 +42063,25 @@ static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
             m->map, m->size, scale->abs_offset, base->abs_offset,
             DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
 }
+
+#ifdef __APPLE__
+/* The single-session HC mix (split-K on Metal) for each row of a session
+ * batch, so every row decodes as its own session would. */
+static bool ds41_hc_mix_rows(ds41_gpu_graph *g, const ds4_model *m,
+                             const ds4_layer_weights *l, bool ffn, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        const ds41_prefill_row *r = &g->rows_view[i];
+        if (!ds4_gpu_dsv41_hc_mix_partial(r->flat_norm, ffn ? r->after_attn : r->residual,
+                m->map, m->size, (ffn ? l->hc_ffn_fn : l->hc_attn_fn)->abs_offset,
+                DS4_N_HC * DS4_N_EMBD) ||
+            !ds4_gpu_dsv41_hc_mix_split(ffn ? r->ffn_split : r->attn_split, r->flat_norm,
+                m->map, m->size, (ffn ? l->hc_ffn_scale : l->hc_attn_scale)->abs_offset,
+                (ffn ? l->hc_ffn_base : l->hc_attn_base)->abs_offset, DS4_N_HC * DS4_N_EMBD,
+                DS4_N_HC_SINKHORN_ITER, DS4_RMS_EPS, DS4_HC_EPS)) return false;
+    }
+    return true;
+}
+#endif
 
 static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
@@ -43312,7 +43349,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         for (int i = 0; ok && i < count; i++)
             ok = ds41_dspark_capture(graphs[i]->dspark, il, positions[i],
                 g->rows_view[i].residual, 1);
+        /* Before the q projection reuses the batch flat_norm, Metal remakes
+         * the attention HC split of each row as its own decode does. */
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
+#ifdef __APPLE__
+            ds41_hc_mix_rows(g, model, l, false, rows) &&
+#endif
             ds41_attention_project_batch(g, model, l, rows);
         bool batch_output = false;
 #ifndef DS4_ROCM_BUILD
@@ -43343,6 +43385,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows) &&
+#ifdef __APPLE__
+            ds41_hc_mix_rows(g, model, l, true, rows) &&
+#endif
             ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
