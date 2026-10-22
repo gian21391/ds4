@@ -15,8 +15,9 @@ struct ds4_metal_args_norm {
 
 // RMSNorm over one activation row, optionally fusing the learned weight
 // multiply. DS4 calls this before attention, before the FFN, and for plain
-// diagnostics that need normalized but unweighted rows.
-template <typename T, short F>
+// diagnostics that need normalized but unweighted rows. The V4.1 variant
+// rounds the input on load and the output on store to BF16.
+template <typename T, short F, bool BF16 = false>
 kernel void kernel_rms_norm_fuse_impl(
         constant ds4_metal_args_norm & args,
         device const char * src0,
@@ -46,7 +47,8 @@ kernel void kernel_rms_norm_fuse_impl(
 
     // parallel sum
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
-        sumf += dot(x[i00], x[i00]);
+        const T v = BF16 ? dsv41_bf16(x[i00]) : x[i00];
+        sumf += dot(v, v);
     }
     sumf = simd_sum(sumf);
 
@@ -69,7 +71,12 @@ kernel void kernel_rms_norm_fuse_impl(
         if (F == 1) {
             y[i00] = (x[i00]*scale);
         }
-        if (F == 2) {
+        if (F == 2 && BF16) {
+            // Reload the rounded input: fast math otherwise rounds the
+            // product differently from the unfused kernel.
+            y[i00] = dsv41_bf16(x[i00]);
+            y[i00] = dsv41_bf16((((device volatile T *) y)[i00]*scale)*f0[i00]);
+        } else if (F == 2) {
             y[i00] = (x[i00]*scale)*f0[i00];
         }
         if (F == 3) {
@@ -83,6 +90,7 @@ typedef decltype(kernel_rms_norm_fuse_impl<float4, 1>) kernel_rms_norm_fuse_t;
 // Host-visible RMSNorm variants: plain norm and norm multiplied by weight.
 template [[host_name("kernel_rms_norm_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1>;
 template [[host_name("kernel_rms_norm_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
+template [[host_name("kernel_dsv41_rms_norm_mul_bf16_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2, true>;
 
 kernel void kernel_add_rms_norm_mul_f32_4(
         constant ds4_metal_args_norm & args,

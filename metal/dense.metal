@@ -142,7 +142,7 @@ static inline void mv_rows4(int rows, F f) {
 // stride nb11 bytes) into NR1 output rows (dst, stride ne0 floats). Each
 // weight block is read once for all rows, and every row gets the K walk and
 // reduction tree of the one-row case, so batched rows match single rows.
-template<short NR0, short NR1>
+template<short NR0, short NR1, bool BF16 = false>
 void kernel_mul_mv_q8_0_f32_rows_impl(
         int ne00, int ne01, uint64_t nb01, uint64_t nb11, int ne0,
         device const char * src0,
@@ -203,14 +203,14 @@ void kernel_mul_mv_q8_0_f32_rows_impl(
 
     FOR_UNROLL (short j = 0; j < NR1; ++j) {
         device float * dst_f32 = (device float *) dst + (uint64_t)j*ne0;
-        helper_mv_reduce_and_write<NR0>(dst_f32, sumf[j], r0, ne01, tiisg, sgitg, shmem);
+        helper_mv_reduce_and_write<NR0, BF16>(dst_f32, sumf[j], r0, ne01, tiisg, sgitg, shmem);
         if (j + 1 < NR1) threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
 // The one-row case: activation row tgpig.y of batch matrix tgpig.z, with the
 // weight matrix broadcast over the batch dimensions by r2/r3.
-template<short NR0, typename args_t>
+template<short NR0, typename args_t, bool BF16 = false>
 void kernel_mul_mv_q8_0_f32_impl(
         args_t args,
         device const char * src0,
@@ -230,7 +230,7 @@ void kernel_mul_mv_q8_0_f32_impl(
     const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
     const uint64_t offset  = (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    kernel_mul_mv_q8_0_f32_rows_impl<NR0, 1>(args.ne00, args.ne01, args.nb01, args.nb11, args.ne0,
+    kernel_mul_mv_q8_0_f32_rows_impl<NR0, 1, BF16>(args.ne00, args.ne01, args.nb01, args.nb11, args.ne0,
         src0 + offset0, src1 + offset1, dst + offset*sizeof(float), shmem, tgpig.x, tiisg, sgitg);
 }
 

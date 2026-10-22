@@ -41580,8 +41580,10 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
 
 static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                       const ds4_model *m, const ds4_tensor *weight) {
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#ifndef DS4_ROCM_BUILD
+#ifndef __APPLE__
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
+#endif
         return ds4_gpu_dsv41_norm(out, in, m->map, m->size, weight->abs_offset,
             (uint32_t)weight->dim[0], 1, DS4_RMS_EPS);
 #endif
@@ -41603,8 +41605,10 @@ static bool ds41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
 
 static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
                           const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split) {
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#ifndef DS4_ROCM_BUILD
+#ifndef __APPLE__
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
+#endif
         return ds4_gpu_dsv41_hc_expand(out, block, residual, split, DS4_N_EMBD, 1);
 #endif
     return ds4_gpu_hc_expand_split_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC) &&
@@ -41658,10 +41662,15 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     const uint32_t group0 = g->tp_rank * groups;
     uint64_t output_row;
-    return tensor_nbytes(l->attn_output_a->type, 4096, &output_row) &&
-        ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
-            l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
+    if (!tensor_nbytes(l->attn_output_a->type, 4096, &output_row)) return false;
+    const uint64_t offset = l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row;
+#ifdef __APPLE__
+    return ds4_gpu_dsv41_attention_output_low(g->low, m->map, m->size, offset,
+                                              4096, 1024, groups, g->heads);
+#else
+    return ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size, offset,
             4096, 1024, groups, g->heads) && ds41_bf16(g->low, groups * DS4_N_LORA_O);
+#endif
 }
 
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
@@ -41800,9 +41809,10 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
     if (projected) return true;
+    /* The Metal BF16 HC expand rounds the block on load. */
     return ds41_attention_output(g, m, l) &&
-           ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
-           ds41_bf16(g->block, DS4_N_EMBD);
+        ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
+        (DS41_METAL || ds41_bf16(g->block, DS4_N_EMBD));
 }
 
 static bool ds41_shared_balance_enabled(void) {
@@ -41932,8 +41942,9 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
-    return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
-        ds41_bf16(g->block, DS4_N_EMBD);
+    /* The Metal BF16 HC expand rounds the block on load. */
+    if (!shared_owner && !ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) return false;
+    return DS41_METAL || ds41_bf16(g->block, DS4_N_EMBD);
 }
 
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
@@ -41988,8 +41999,10 @@ static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                             const ds4_model *m, const ds4_tensor *weight, uint32_t count) {
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#ifndef DS4_ROCM_BUILD
+#ifndef __APPLE__
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
+#endif
         return ds4_gpu_dsv41_norm(out, in, m->map, m->size, weight->abs_offset,
             (uint32_t)weight->dim[0], count, DS4_RMS_EPS);
 #endif

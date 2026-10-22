@@ -3389,7 +3389,9 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
 // The generic GGML-style id matvec supports arbitrary routed expert ids.  Here
 // the id is always equal to the group number, so this wrapper keeps the exact
 // Q8_0 dot kernel but removes the id-buffer load and the CPU-side id table.
-kernel void kernel_dsv4_attn_out_low_q8_0_f32(
+// The V4.1 variant stores the result rounded to BF16.
+template<bool BF16>
+kernel void kernel_dsv4_attn_out_low_q8_0(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
@@ -3433,7 +3435,7 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         /*.r3   =*/ 1,
     };
 
-    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &>(
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, BF16>(
         args0,
         src0_cur,
         src1_cur,
@@ -3443,6 +3445,8 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         tiisg,
         sgitg);
 }
+
+typedef decltype(kernel_dsv4_attn_out_low_q8_0<false>) kernel_dsv4_attn_out_low_q8_0_t;
 
 // The F32 attention output low projection for up to four tokens per
 // threadgroup (ne12 tokens, nei1 groups of four), reading each group's
@@ -3465,6 +3469,9 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32_rows4(
             dst + ((uint64_t)idx*args.ne0 + (uint64_t)r1*args.ne1*args.ne0)*sizeof(float), shmem, tgpig.x, tiisg, sgitg);
     });
 }
+
+template [[host_name("kernel_dsv4_attn_out_low_q8_0_f32")]]   kernel kernel_dsv4_attn_out_low_q8_0_t kernel_dsv4_attn_out_low_q8_0<false>;
+template [[host_name("kernel_dsv41_attn_out_low_q8_0_bf16")]] kernel kernel_dsv4_attn_out_low_q8_0_t kernel_dsv4_attn_out_low_q8_0<true>;
 
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         constant ds4_metal_args_mul_mv_id & args,

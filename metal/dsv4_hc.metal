@@ -81,6 +81,7 @@ struct ds4_metal_args_dsv4_hc_expand {
     uint64_t nb1;
     uint64_t nb2;
     int32_t  has_add;
+    int32_t  bf16;
 };
 
 // Numerically stable sigmoid for the standalone split/sinkhorn path. The naive
@@ -649,6 +650,8 @@ kernel void kernel_dsv4_hc_expand(
 // HC=4 specialization of the post/expand step. One thread computes all four
 // destination HC streams for one token/dimension, reusing the same block output
 // and residual HC values while preserving the per-stream accumulation order.
+// V4.1 sets bf16 to round the block (and the add, before adding it) on load
+// and the output on store.
 kernel void kernel_dsv4_hc_expand4(
         constant ds4_metal_args_dsv4_hc_expand & args,
         device  const char * block_out,
@@ -672,7 +675,11 @@ kernel void kernel_dsv4_hc_expand4(
 
     float block_v = *((device const float *) (block_out + d*args.nb_block0 + t*args.nb_block1));
     if (args.has_add) {
-        block_v += *((device const float *) (block_add + d*args.nb_add0 + t*args.nb_add1));
+        const float add_v = *((device const float *) (block_add + d*args.nb_add0 + t*args.nb_add1));
+        block_v += args.bf16 ? dsv41_bf16(add_v) : add_v;
+    }
+    if (args.bf16) {
+        block_v = dsv41_bf16(block_v);
     }
 
     const float r0 = *((device const float *) (residual + d*args.nb_res0 + 0*args.nb_res1 + t*args.nb_res2));
@@ -688,7 +695,7 @@ kernel void kernel_dsv4_hc_expand4(
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 2*args.nb_comb1 + t*args.nb_comb2)) * r2;
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 3*args.nb_comb1 + t*args.nb_comb2)) * r3;
 
-        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = acc;
+        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = args.bf16 ? dsv41_bf16(acc) : acc;
     }
 }
 

@@ -23,15 +23,13 @@ typedef enum {
 } ds4_v41_activation_format;
 int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
                           ds4_v41_activation_format format);
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /* Same reductions as the ordinary kernels, with the required BF16 store
- * folded into the operation. hc_sum reads either 4- or 24-float row weights. */
+ * folded into the operation. Metal also rounds the norm input and the expand
+ * block on load. */
 int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t offset,
         uint32_t width, uint32_t rows, float eps);
-int ds4_gpu_dsv41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
-        const ds4_gpu_tensor *weights, uint32_t width, uint32_t rows,
-        uint32_t weight_stride);
 int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
         const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
         uint32_t width, uint32_t rows);
@@ -64,10 +62,21 @@ int ds4_gpu_dsv41_shared_start(
 int ds4_gpu_dsv41_shared_join(void);
 #endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+/* The BF16 HC sum; it reads either 4- or 24-float row weights. */
+int ds4_gpu_dsv41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *weights, uint32_t width, uint32_t rows,
+        uint32_t weight_stride);
 /* Mask a computed short batch before the owned router filter mutates IDs. */
 int ds4_gpu_dsv41_shared_mask(ds4_gpu_tensor *shared, const ds4_gpu_tensor *selected,
         uint32_t width, uint32_t rows, uint32_t experts, uint32_t active,
         uint32_t rank, uint32_t tie_owner);
+#endif
+#ifdef __APPLE__
+/* Decode attention output side: the Q8 low projection stores BF16. */
+int ds4_gpu_dsv41_attention_output_low(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups, const ds4_gpu_tensor *heads);
 #endif
 /* Full-head prefill, with BF16 rounding between the two Q8 projections. */
 int ds4_gpu_dsv41_attention_output_batch(

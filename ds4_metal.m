@@ -5733,6 +5733,7 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     int32_t has_add;
+    int32_t bf16;
 } ds4_gpu_hc_expand_args;
 
 typedef struct {
@@ -22463,7 +22464,7 @@ int ds4_gpu_rms_norm_weight_tensor(
     return ds4_gpu_rms_norm_weight_rows_tensor(out, x, model_map, model_size, weight_offset, n, 1, eps);
 }
 
-int ds4_gpu_rms_norm_weight_rows_tensor(
+static int ds4_gpu_rms_norm_weight_rows(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
         const void             *model_map,
@@ -22471,7 +22472,8 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint64_t                weight_offset,
         uint32_t                n,
         uint32_t                rows,
-        float                   eps) {
+        float                   eps,
+        bool                    bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (n == 0 || rows == 0 || (n & 3u) != 0) return 0;
 
@@ -22499,13 +22501,16 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
                                                        &inner_offset);
         if (!wbuf) return 0;
 
+        id<MTLComputePipelineState> pipeline = bf16 ?
+            ds4_gpu_get_pipeline("kernel_dsv41_rms_norm_mul_bf16_f32_4") : g_rms_norm_pipeline;
+        if (!pipeline) return 0;
         ds4_gpu_rms_norm_args args = ds4_gpu_make_rms_norm_args(n, rows, eps);
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_rms_norm_pipeline];
+        [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:2];
@@ -22520,6 +22525,19 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n, uint32_t rows, float eps) {
+    return ds4_gpu_rms_norm_weight_rows(out, x, model_map, model_size, weight_offset, n, rows, eps, false);
+}
+
+/* Unlike CUDA, x is also rounded on load, so it may be unrounded. */
+int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t offset,
+        uint32_t width, uint32_t rows, float eps) {
+    return ds4_gpu_rms_norm_weight_rows(out, x, map, size, offset, width, rows, eps, true);
 }
 
 /* One V4.1 dispatch in the current command batch: each binding is a buffer
@@ -27075,7 +27093,7 @@ int ds4_gpu_attention_output_q8_tp_tensor(
     }
 }
 
-int ds4_gpu_attention_output_low_q8_tensor(
+static int ds4_gpu_attention_output_low_q8_impl(
         ds4_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
@@ -27083,7 +27101,8 @@ int ds4_gpu_attention_output_low_q8_tensor(
         uint64_t                group_dim,
         uint64_t                rank,
         uint32_t                n_groups,
-        const ds4_gpu_tensor *heads) {
+        const ds4_gpu_tensor *heads,
+        bool                    bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!low || !heads || !model_map || group_dim == 0 || rank == 0 ||
         n_groups == 0 || group_dim > UINT32_MAX || rank > UINT32_MAX) {
@@ -27153,7 +27172,8 @@ int ds4_gpu_attention_output_low_q8_tensor(
                 .nr0 = 2,
             };
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
+                ds4_gpu_get_mul_mv_pipeline(bf16 ?
+                    "kernel_dsv41_attn_out_low_q8_0_bf16" : "kernel_dsv4_attn_out_low_q8_0_f32", 4);
             ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                                                          pipeline,
                                                          &args,
@@ -27173,6 +27193,21 @@ int ds4_gpu_attention_output_low_q8_tensor(
         }
         return ok ? 1 : 0;
     }
+}
+
+int ds4_gpu_attention_output_low_q8_tensor(ds4_gpu_tensor *low, const void *model_map,
+        uint64_t model_size, uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups, const ds4_gpu_tensor *heads) {
+    return ds4_gpu_attention_output_low_q8_impl(low, model_map, model_size, out_a_offset,
+                                                group_dim, rank, n_groups, heads, false);
+}
+
+int ds4_gpu_dsv41_attention_output_low(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups, const ds4_gpu_tensor *heads) {
+    return ds4_gpu_attention_output_low_q8_impl(low, model_map, model_size, out_a_offset,
+                                                group_dim, rank, n_groups, heads, true);
 }
 
 int ds4_gpu_attention_output_low_q4_K_slice_tensor(
@@ -46102,13 +46137,14 @@ int ds4_gpu_hc_expand_add_tensor(
     return 1;
 }
 
-int ds4_gpu_hc_expand_split_tensor(
+static int ds4_gpu_hc_expand_split(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) {
+        uint32_t                n_hc,
+        bool                    bf16) {
     if (!g_initialized && !ds4_gpu_init()) {
         fprintf(stderr, "ds4: Metal HC expand split could not initialize the backend\n");
         return 0;
@@ -46180,6 +46216,7 @@ int ds4_gpu_hc_expand_split_tensor(
             .nb1 = (uint64_t)n_embd * sizeof(float),
             .nb2 = (uint64_t)n_hc * n_embd * sizeof(float),
             .has_add = 0,
+            .bf16 = bf16,
         };
         id<MTLComputePipelineState> expand_pipeline = g_hc_expand_pipeline;
         uint64_t n_elem = (uint64_t)n_embd * n_hc * n_tokens64;
@@ -46218,6 +46255,20 @@ int ds4_gpu_hc_expand_split_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+        uint32_t n_embd, uint32_t n_hc) {
+    return ds4_gpu_hc_expand_split(out_hc, block_out, residual_hc, split, n_embd, n_hc, false);
+}
+
+/* Unlike CUDA, the block is also rounded on load, so it may be unrounded. */
+int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
+        uint32_t width, uint32_t rows) {
+    return out && ds4_gpu_tensor_bytes(out) == (uint64_t)width * 4u * rows * sizeof(float) &&
+        ds4_gpu_hc_expand_split(out, block, residual, split, width, 4, true);
 }
 
 int ds4_gpu_hc_expand_split_half_tensor(
