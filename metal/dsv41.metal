@@ -37,19 +37,43 @@ struct ds4_metal_args_dsv41_rope {
     float frequencies[32];
 };
 
+/* Shared and noinline so the RoPEs fused into other kernels compile to the
+ * same arithmetic as this kernel's. */
+static __attribute__((noinline)) float2 dsv41_rope_pair(float re, float im, float theta,
+                                                        uint inverse) {
+    const float c = precise::cos(theta);
+    const float s = inverse ? -precise::sin(theta) : precise::sin(theta);
+    return float2(dsv41_bf16(re * c - im * s), dsv41_bf16(re * s + im * c));
+}
+
 kernel void kernel_dsv41_rope(
         constant ds4_metal_args_dsv41_rope &args,
         device float *x,
         uint2 group [[threadgroup_position_in_grid]],
         uint lane [[thread_index_in_simdgroup]]) {
     const float theta = float(args.start + group.y * args.stride) * args.frequencies[lane];
-    const float c = precise::cos(theta);
-    const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
     const ulong i = ((ulong)group.y * args.heads + group.x) * args.width +
                     args.width - 64u + 2u * lane;
-    const float re = x[i], im = x[i + 1u];
-    x[i] = dsv41_bf16(re * c - im * s);
-    x[i + 1u] = dsv41_bf16(re * s + im * c);
+    const float2 y = dsv41_rope_pair(x[i], x[i + 1u], theta, args.inverse);
+    x[i] = y.x;
+    x[i + 1u] = y.y;
+}
+
+/* One lane of a quantization block: the block's simdgroup lanes hold the
+ * BF16-rounded values (zero past the block). */
+static inline float dsv41_quantize_lane(float value, uint mode) {
+    const float amax = simd_max(abs(value));
+    float result = value;
+    if (mode == 1u) {
+        const float scale = dsv41_pow2_ceil(max(amax, 1.0e-4f) * (1.0f / 448.0f));
+        result = copysign(dsv4_e4m3fn_dequant(abs(value) / scale), value) * scale;
+    } else if (mode == 2u || mode == 3u) {
+        const float scale = mode == 3u
+            ? dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
+            : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
+        result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+    }
+    return dsv41_bf16(result);
 }
 
 kernel void kernel_dsv41_quantize(
@@ -61,19 +85,29 @@ kernel void kernel_dsv41_quantize(
     const uint column = group.x * block + lane;
     const bool valid = lane < block && column < args.width;
     const ulong index = (ulong)group.y * args.width + column;
-    const float value = valid ? dsv41_bf16(x[index]) : 0.0f;
-    const float amax = simd_max(abs(value));
-    float result = value;
-    if (args.mode == 1u) {
-        const float scale = dsv41_pow2_ceil(max(amax, 1.0e-4f) * (1.0f / 448.0f));
-        result = copysign(dsv4_e4m3fn_dequant(abs(value) / scale), value) * scale;
-    } else if (args.mode == 2u || args.mode == 3u) {
-        const float scale = args.mode == 3u
-            ? dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
-            : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
-        result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+    const float result = dsv41_quantize_lane(valid ? dsv41_bf16(x[index]) : 0.0f, args.mode);
+    if (valid) x[index] = result;
+}
+
+// kernel_dsv41_bf16_linear, kernel_dsv41_rope and kernel_dsv41_quantize
+// (32-wide blocks) in turn on one head row per threadgroup of width threads:
+// the RoPE tail pairs adjacent lanes.
+kernel void kernel_dsv41_rope_quantize(
+        constant ds4_metal_args_dsv41_rope &args,
+        constant uint &mode,
+        device float *x,
+        uint head [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const ulong i = (ulong)head * args.width + tid;
+    float value = dsv41_bf16(x[i]);
+    const float other = simd_shuffle_xor(value, 1u);
+    const uint tail = args.width - 64u;
+    if (tid >= tail) {
+        const float theta = float(args.start) * args.frequencies[(tid - tail) / 2u];
+        value = tid & 1u ? dsv41_rope_pair(other, value, theta, args.inverse).y
+                         : dsv41_rope_pair(value, other, theta, args.inverse).x;
     }
-    if (valid) x[index] = dsv41_bf16(result);
+    x[i] = dsv41_quantize_lane(value, mode);
 }
 
 struct ds4_metal_args_dsv41_engram {

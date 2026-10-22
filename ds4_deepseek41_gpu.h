@@ -121,6 +121,12 @@ int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
 int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                              uint32_t rows, uint32_t start, uint32_t stride,
                              bool compressed, bool inverse);
+/* BF16 rounding, then the RoPE of one row, then the FP8 or FP4 E8M0
+ * quantization, as ds4_gpu_dsv41_quantize, ds4_gpu_dsv41_rope and
+ * ds4_gpu_dsv41_quantize in turn. */
+int ds4_gpu_dsv41_rope_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                               uint32_t start, bool compressed,
+                               ds4_v41_activation_format format);
 int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            const ds4_gpu_tensor *kv,
                            const ds4_gpu_tensor *q_weight,
