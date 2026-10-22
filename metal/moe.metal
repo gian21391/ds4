@@ -3569,6 +3569,12 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_f32(
         sgitg);
 }
 
+// Exact float of an integer below 2^23: OR'ed into the mantissa of 2^23 and
+// 2^23 subtracted.  Cheaper than the int-to-float convert in the decode loops.
+static inline float ds4_small_uint_to_f32(uint x) {
+    return as_type<float>(0x4B000000u | x) - 8388608.0f;
+}
+
 // Decode-only routed expert gate/up projection fused with the DS4 activation:
 //
 //     mid = silu(clamp(gate)) * clamp(up) * route_weight
@@ -3623,14 +3629,10 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     float sumu[N_R0_IQ2_XXS] = {0.f};
 
     threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
-    threadgroup uint8_t  *ssigns  = (threadgroup uint8_t *)(svalues + 256);
     {
         int nval = 4;
         int pos = (32 * sgitg + tiisg) * nval;
         for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -3665,12 +3667,17 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
             for (short l = 0; l < 4; ++l) {
                 const threadgroup uint8_t *gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
                 const threadgroup uint8_t *gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
-                const uint8_t signg = ssigns[(aux32g >> 7 * l) & 127];
-                const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
+                const uint ig = (aux32g >> 7 * l) & 127;
+                const uint8_t signg = ig | ((popcount(ig) & 1) << 7);
+                const uint iu = (aux32u >> 7 * l) & 127;
+                const uint8_t signu = iu | ((popcount(iu) & 1) << 7);
+                // The rounded product is negated, as the sign multiply did.
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8 * l + j];
-                    sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
-                    su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    const float pg = v * ds4_small_uint_to_f32(gridg[j]);
+                    const float pu = v * ds4_small_uint_to_f32(gridu[j]);
+                    sg += signg & ds4_metal_kmask_iq2xs[j] ? -pg : pg;
+                    su += signu & ds4_metal_kmask_iq2xs[j] ? -pu : pu;
                 }
             }
             sumg[row] += dg * sg;
