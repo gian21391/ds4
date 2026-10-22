@@ -19787,6 +19787,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         if (!wbuf) return 0;
 
         ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        dispatch.function_name = "kernel_mul_mv_q8_0_f32_rows4";
         if (out_dim > 65536u) dispatch.nsg = 8;
         ds4_gpu_q8_0_matvec_args args =
             ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
@@ -19814,7 +19815,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                 MTLSizeMake(((NSUInteger)out_dim +
                              (NSUInteger)dispatch.nr0 - 1u) /
                                 (NSUInteger)dispatch.nr0,
-                            (NSUInteger)n_rows,
+                            ((NSUInteger)n_rows + 3u) / 4u,
                             1)
              threadsPerThreadgroup:
                 MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
@@ -26180,7 +26181,7 @@ static int ds4_gpu_attention_output_q8_batch_impl(
             } else if (use_direct_low) {
                 ds4_gpu_mul_mv_id_args args = {
                     .nei0 = (int32_t)n_groups,
-                    .nei1 = (int32_t)n_tokens,
+                    .nei1 = (int32_t)(n_tokens + 3u) / 4,
                     .nbi1 = 0,
                     .ne00 = (int32_t)group_dim,
                     .ne01 = (int32_t)rank,
@@ -26201,7 +26202,7 @@ static int ds4_gpu_attention_output_q8_batch_impl(
                     .nr0 = 2,
                 };
                 id<MTLComputePipelineState> pipeline =
-                    ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
+                    ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32_rows4", 4);
                 ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                                                              pipeline,
                                                              &args,

@@ -112,6 +112,90 @@ static inline void helper_mv_reduce_and_write(
     }
 }
 
+// Calls f with an integral_constant row count: min(4, rows), so a row-batched
+// matvec gets its row loops unrolled for each tail size.
+template<typename F>
+static inline void mv_rows4(int rows, F f) {
+    switch (min(4, rows)) {
+        case 4: f(integral_constant<short, 4>()); break;
+        case 3: f(integral_constant<short, 3>()); break;
+        case 2: f(integral_constant<short, 2>()); break;
+        default: f(integral_constant<short, 1>()); break;
+    }
+}
+
+// Decode-time Q8_0 matrix-vector multiply over NR1 activation rows (src1,
+// stride nb11 bytes) into NR1 output rows (dst, stride ne0 floats). Each
+// weight block is read once for all rows, and every row gets the K walk and
+// reduction tree of the one-row case, so batched rows match single rows.
+template<short NR0, short NR1>
+void kernel_mul_mv_q8_0_f32_rows_impl(
+        int ne00, int ne01, uint64_t nb01, uint64_t nb11, int ne0,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint   tgx,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = ne00/QK8_0;
+
+    const int r0 = tgx*NR0;
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *) (src0 + (r0 + row)*nb01);
+    }
+
+    float sumf[NR1][NR0] = { { 0.f } };
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+
+    const int ib0 = sgitg*NQ + ix;
+
+    float yl[NR1][NQ];
+
+    device const float * yb = (device const float *) src1 + ib0*QK8_0 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        FOR_UNROLL (short j = 0; j < NR1; ++j) {
+            device const float * y = (device const float *) ((device const char *) yb + j*nb11);
+            for (short i = 0; i < NQ; ++i) {
+                yl[j][i] = y[i];
+            }
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+
+            FOR_UNROLL (short j = 0; j < NR1; ++j) {
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    sumq += qs[i] * yl[j][i];
+                }
+
+                sumf[j][row] += sumq*ax[row][ib].d;
+            }
+        }
+
+        yb += NSG*NQ*QK8_0;
+    }
+
+    FOR_UNROLL (short j = 0; j < NR1; ++j) {
+        device float * dst_f32 = (device float *) dst + (uint64_t)j*ne0;
+        helper_mv_reduce_and_write<NR0>(dst_f32, sumf[j], r0, ne01, tiisg, sgitg, shmem);
+        if (j + 1 < NR1) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// The one-row case: activation row tgpig.y of batch matrix tgpig.z, with the
+// weight matrix broadcast over the batch dimensions by r2/r3.
 template<short NR0, typename args_t>
 void kernel_mul_mv_q8_0_f32_impl(
         args_t args,
@@ -122,64 +206,18 @@ void kernel_mul_mv_q8_0_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
-    const short NSG = FC_mul_mv_nsg;
-
-    constexpr short NW = N_SIMDWIDTH;
-    constexpr short NQ = 8;
-
-    const int nb = args.ne00/QK8_0;
-
-    const int r0 = tgpig.x*NR0;
     const int r1 = tgpig.y;
     const int im = tgpig.z;
 
     const uint i12 = im%args.ne12;
     const uint i13 = im/args.ne12;
 
+    const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
     const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+    const uint64_t offset  = (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    device const float * y = (device const float *) (src1 + offset1);
-
-    device const block_q8_0 * ax[NR0];
-    FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
-
-        ax[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
-    }
-
-    float sumf[NR0] = { 0.f };
-
-    const short ix = tiisg/(NW/NQ);
-    const short il = tiisg%(NW/NQ);
-
-    const int ib0 = sgitg*NQ + ix;
-
-    float yl[NQ];
-
-    device const float * yb = y + ib0*QK8_0 + il*NQ;
-
-    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
-        for (short i = 0; i < NQ; ++i) {
-            yl[i] = yb[i];
-        }
-
-        for (short row = 0; row < NR0; row++) {
-            device const int8_t * qs = ax[row][ib].qs + il*NQ;
-
-            float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < NQ; ++i) {
-                sumq += qs[i] * yl[i];
-            }
-
-            sumf[row] += sumq*ax[row][ib].d;
-        }
-
-        yb += NSG*NQ*QK8_0;
-    }
-
-    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
-
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    kernel_mul_mv_q8_0_f32_rows_impl<NR0, 1>(args.ne00, args.ne01, args.nb01, args.nb11, args.ne0,
+        src0 + offset0, src1 + offset1, dst + offset*sizeof(float), shmem, tgpig.x, tiisg, sgitg);
 }
 
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
@@ -195,6 +233,26 @@ kernel void kernel_mul_mv_q8_0_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+// Q8_0 matvec over up to four of the ne11 activation rows per threadgroup.
+// Session batches use it for their dense projections.
+[[host_name("kernel_mul_mv_q8_0_f32_rows4")]]
+kernel void kernel_mul_mv_q8_0_f32_rows4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int r1 = tgpig.y*4;
+    mv_rows4(args.ne11 - r1, [&](auto nr1) {
+        kernel_mul_mv_q8_0_f32_rows_impl<N_R0_Q8_0, decltype(nr1)::value>(args.ne00, args.ne01,
+            args.nb01, args.nb11, args.ne0, src0, src1 + r1*args.nb11,
+            dst + (uint64_t)r1*args.ne0*sizeof(float), shmem, tgpig.x, tiisg, sgitg);
+    });
 }
 
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same

@@ -3444,6 +3444,28 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         sgitg);
 }
 
+// The F32 attention output low projection for up to four tokens per
+// threadgroup (ne12 tokens, nei1 groups of four), reading each group's
+// weights once with the per-token arithmetic of the kernel above.
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_rows4(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int idx = tgpig.z%args.nei0;
+    const int r1 = (tgpig.z/args.nei0)*4;
+    mv_rows4(args.ne12 - r1, [&](auto nr1) {
+        kernel_mul_mv_q8_0_f32_rows_impl<N_R0_Q8_0, decltype(nr1)::value>(args.ne00, args.ne01,
+            args.nb01, args.nb12, args.ne1*args.ne0, src0s + idx*args.nb02,
+            src1 + idx*args.nb11 + r1*args.nb12,
+            dst + ((uint64_t)idx*args.ne0 + (uint64_t)r1*args.ne1*args.ne0)*sizeof(float), shmem, tgpig.x, tiisg, sgitg);
+    });
+}
+
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
