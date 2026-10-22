@@ -34273,6 +34273,32 @@ static int ds4_gpu_encode_router_select(
         return 1;
     }
 
+    /* V4.1 decode, including a session batch's handful of rows.  The weight
+     * scale tells V4.1 (1.5) from V4 Pro (2.5), which shares the expert counts
+     * but keeps its validated path. */
+    if (n_expert == 384u && n_expert_used == 6u && n_tokens <= 8u &&
+        fabsf(expert_weight_scale - 1.5f) <= 1.0e-6f &&
+        has_bias && !hash_mode && !mixed_visual && !g_quality_mode &&
+        getenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSION") == NULL) {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv41_router_select_one");
+        if (!pipeline) return 0;
+        const float scale = expert_weight_scale;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&scale length:sizeof(scale) atIndex:0];
+        [enc setBuffer:logitsbuf offset:logits_off atIndex:1];
+        [enc setBuffer:probsbuf offset:probs_off atIndex:2];
+        [enc setBuffer:biasbuf offset:bias_off atIndex:3];
+        [enc setBuffer:selectedbuf offset:selected_off atIndex:4];
+        [enc setBuffer:weightsbuf offset:weights_off atIndex:5];
+        [enc setThreadgroupMemoryLength:5u * 512u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return 1;
+    }
+
     if (flash_router_fast_path && !mixed_visual && !g_quality_mode && n_tokens == 1) {
         id<MTLComputePipelineState> softplus_sqrt_pipeline =
             ds4_gpu_hot_pipeline(g_dsv4_softplus_sqrt_pipeline,
