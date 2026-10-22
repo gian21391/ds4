@@ -330,7 +330,12 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
     return ok;
 }
 
+#ifdef __APPLE__
+/* Eight readers finish the first table while Metal runs layer 0. */
+enum { TOKEN_READERS = 8 };
+#else
 enum { TOKEN_READERS = 4 };
+#endif
 
 typedef struct {
     pthread_t thread;
