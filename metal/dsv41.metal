@@ -83,6 +83,12 @@ struct ds4_metal_args_dsv41_engram {
     uint masked;
 };
 
+#define DSV41_ENGRAM_CHUNK 2560u
+
+/* One threadgroup per (row, HC): all threads stage a chunk of the inputs in
+ * threadgroup memory, and the first simdgroup sums them per lane in column
+ * order (as a lone simdgroup reading device memory would, but without
+ * waiting on each load). */
 kernel void kernel_dsv41_engram_add(
         constant ds4_metal_args_dsv41_engram &args,
         device float *residual,
@@ -90,27 +96,53 @@ kernel void kernel_dsv41_engram_add(
         device const float *q_weight,
         device const float *k_weight,
         device const uchar *mask,
+        threadgroup float *shared [[threadgroup(0)]],
         uint2 group [[threadgroup_position_in_grid]],
+        uint2 nt2 [[threads_per_threadgroup]],
+        uint tid [[thread_index_in_threadgroup]],
         uint lane [[thread_index_in_simdgroup]]) {
     if (args.masked && !mask[group.x]) return;
+    const uint nt = nt2.x;
     const ulong offset = ((ulong)group.x * 4u + group.y) * args.width;
     const ulong key_offset = ((ulong)group.x * 5u + group.y) * args.width;
     const ulong value_offset = ((ulong)group.x * 5u + 4u) * args.width;
+    device const float *q = q_weight + group.y * args.width;
+    device const float *kw = k_weight + group.y * args.width;
+    threadgroup float *sh = shared;
+    threadgroup float *sk = shared + DSV41_ENGRAM_CHUNK;
+    threadgroup float *sw = shared + 2u * DSV41_ENGRAM_CHUNK;
+    threadgroup float *sgate = shared + 3u * DSV41_ENGRAM_CHUNK;
     float h2 = 0.0f, k2 = 0.0f, dot = 0.0f;
-    for (uint i = lane; i < args.width; i += 32u) {
-        const float h = residual[offset + i];
-        const float k = dsv41_bf16(kv[key_offset + i]);
-        const uint wi = group.y * args.width + i;
-        h2 += h * h;
-        k2 += k * k;
-        dot += h * (q_weight[wi] * k_weight[wi]) * k;
+    for (uint c = 0; c < args.width; c += DSV41_ENGRAM_CHUNK) {
+        const uint n = min(DSV41_ENGRAM_CHUNK, args.width - c);
+        for (uint i = tid; i < n; i += nt) {
+            sh[i] = residual[offset + c + i];
+            sk[i] = dsv41_bf16(kv[key_offset + c + i]);
+            sw[i] = q[c + i] * kw[c + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 32u) {
+            for (uint i = lane; i < n; i += 32u) {
+                const float h = sh[i];
+                const float k = sk[i];
+                h2 += h * h;
+                k2 += k * k;
+                dot += h * sw[i] * k;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    h2 = simd_sum(h2);
-    k2 = simd_sum(k2);
-    dot = simd_sum(dot) * rsqrt(h2 / args.width + args.eps) *
-          rsqrt(k2 / args.width + args.eps) * rsqrt(float(args.width));
-    const float gate = 1.0f / (1.0f + exp(-copysign(sqrt(max(abs(dot), 1.0e-6f)), dot)));
-    for (uint i = lane; i < args.width; i += 32u)
+    if (tid < 32u) {
+        h2 = simd_sum(h2);
+        k2 = simd_sum(k2);
+        dot = simd_sum(dot) * rsqrt(h2 / args.width + args.eps) *
+              rsqrt(k2 / args.width + args.eps) * rsqrt(float(args.width));
+        if (tid == 0)
+            sgate[0] = 1.0f / (1.0f + exp(-copysign(sqrt(max(abs(dot), 1.0e-6f)), dot)));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float gate = sgate[0];
+    for (uint i = tid; i < args.width; i += nt)
         residual[offset + i] = dsv41_bf16(residual[offset + i] +
             gate * dsv41_bf16(kv[value_offset + i]));
 }
