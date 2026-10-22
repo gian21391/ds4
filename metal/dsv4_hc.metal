@@ -651,7 +651,9 @@ kernel void kernel_dsv4_hc_expand(
 // destination HC streams for one token/dimension, reusing the same block output
 // and residual HC values while preserving the per-stream accumulation order.
 // V4.1 sets bf16 to round the block (and the add, before adding it) on load
-// and the output on store.
+// and the output on store. The FMA chain is written out (fast math already
+// contracts it to the same instructions) so the fused V4.1 layer boundary,
+// kernel_dsv41_hc_expand_sum_rms_norm_mul_bf16_f32_4, matches it by construction.
 kernel void kernel_dsv4_hc_expand4(
         constant ds4_metal_args_dsv4_hc_expand & args,
         device  const char * block_out,
@@ -690,10 +692,10 @@ kernel void kernel_dsv4_hc_expand4(
     for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
         float acc = block_v * *((device const float *) (post + dst_hc*args.nb_post0 + t*args.nb_post1));
 
-        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 0*args.nb_comb1 + t*args.nb_comb2)) * r0;
-        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 1*args.nb_comb1 + t*args.nb_comb2)) * r1;
-        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 2*args.nb_comb1 + t*args.nb_comb2)) * r2;
-        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 3*args.nb_comb1 + t*args.nb_comb2)) * r3;
+        acc = fma(*((device const float *) (comb + dst_hc*args.nb_comb0 + 0*args.nb_comb1 + t*args.nb_comb2)), r0, acc);
+        acc = fma(*((device const float *) (comb + dst_hc*args.nb_comb0 + 1*args.nb_comb1 + t*args.nb_comb2)), r1, acc);
+        acc = fma(*((device const float *) (comb + dst_hc*args.nb_comb0 + 2*args.nb_comb1 + t*args.nb_comb2)), r2, acc);
+        acc = fma(*((device const float *) (comb + dst_hc*args.nb_comb0 + 3*args.nb_comb1 + t*args.nb_comb2)), r3, acc);
 
         *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = args.bf16 ? dsv41_bf16(acc) : acc;
     }

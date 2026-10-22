@@ -43,6 +43,13 @@ int ds4_gpu_dsv41_hc_sum_norm(ds4_gpu_tensor *out, ds4_gpu_tensor *sum,
 int ds4_gpu_dsv41_hc_expand_add(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
         const ds4_gpu_tensor *add, const ds4_gpu_tensor *residual,
         const ds4_gpu_tensor *split, uint32_t width, uint32_t rows);
+/* hc_expand_add, then the next layer's hc_sum_norm with pre = split[0:4],
+ * which it also stores. */
+int ds4_gpu_dsv41_hc_expand_sum_norm(ds4_gpu_tensor *out_hc, ds4_gpu_tensor *pre,
+        ds4_gpu_tensor *out, ds4_gpu_tensor *sum, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *add, const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *split, const void *map, uint64_t size,
+        uint64_t offset, uint32_t width, float eps);
 /* Whether the routed experts of rows tokens encode as one fused pair-SwiGLU
  * dispatch and one direct sum6 dispatch: the only route that may share
  * concurrent levels with the shared expert. */

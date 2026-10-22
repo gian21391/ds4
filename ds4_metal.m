@@ -22608,6 +22608,35 @@ int ds4_gpu_dsv41_hc_sum_norm(ds4_gpu_tensor *out, ds4_gpu_tensor *sum,
     }
 }
 
+int ds4_gpu_dsv41_hc_expand_sum_norm(ds4_gpu_tensor *out_hc, ds4_gpu_tensor *pre,
+        ds4_gpu_tensor *out, ds4_gpu_tensor *sum, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *add, const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *split, const void *map, uint64_t size,
+        uint64_t offset, uint32_t width, float eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint64_t row_bytes = (uint64_t)width * sizeof(float);
+    if (!out_hc || !pre || !out || !sum || !block || !add || !residual || !split ||
+        width == 0 || (width & 3u) != 0 ||
+        ds4_gpu_tensor_bytes(out_hc) != 4u * row_bytes ||
+        ds4_gpu_tensor_bytes(residual) < 4u * row_bytes ||
+        ds4_gpu_tensor_bytes(pre) < 4u * sizeof(float) ||
+        ds4_gpu_tensor_bytes(split) < 24u * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < row_bytes || ds4_gpu_tensor_bytes(sum) < row_bytes ||
+        ds4_gpu_tensor_bytes(block) < row_bytes || ds4_gpu_tensor_bytes(add) < row_bytes ||
+        offset > size || row_bytes > size - offset) return 0;
+
+    @autoreleasepool {
+        const ds4_gpu_rms_norm_args args = ds4_gpu_make_rms_norm_args(width, 1, eps);
+        const dsv41_bind binds[] = {dsv41_bytes(&args, sizeof(args)), dsv41_tensor(block),
+            dsv41_tensor(add), dsv41_tensor(residual), dsv41_tensor(split), dsv41_tensor(out_hc),
+            dsv41_tensor(pre), dsv41_tensor(sum), dsv41_model(map, size, offset, row_bytes),
+            dsv41_tensor(out)};
+        return dsv41_dispatch(ds4_gpu_get_pipeline("kernel_dsv41_hc_expand_sum_rms_norm_mul_bf16_f32_4"),
+            binds, 10, 32u * sizeof(float), MTLSizeMake(1, 1, 1),
+            MTLSizeMake(ds4_gpu_rms_norm_threads(width), 1, 1), "V4.1 HC expand sum norm");
+    }
+}
+
 int ds4_gpu_add_rms_norm_weight_tensor(
         ds4_gpu_tensor       *norm_out,
         ds4_gpu_tensor       *sum_out,

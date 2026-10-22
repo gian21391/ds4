@@ -42299,10 +42299,26 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
     return ok && ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
+/* With next_norm (Metal, one device), the post-FFN expand also forms the
+ * next layer's HC sum and norm, so that layer starts normed and makes only
+ * its attention HC mix. */
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
-                            const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
-        ds41_graph_after_moe(g);
+                            const ds4_layer_weights *l, uint32_t il, int token,
+                            bool normed, const ds4_tensor *next_norm) {
+    if ((!normed && !ds41_graph_before_attention(g, m, l, il)) ||
+        (normed && !ds41_hc_mix(g, m, l, false)) ||
+        !ds41_attention(g, m, l, il, false) ||
+        !ds41_graph_after_attention(g, m, l) ||
+        !ds41_moe(g, m, l, il, (uint32_t)token)) return false;
+#ifdef __APPLE__
+    if (next_norm)
+        return ds4_gpu_dsv41_hc_expand_sum_norm(g->residual, g->pre, g->norm, g->x,
+            g->routed, g->shared, g->after_attn, g->ffn_split, m->map, m->size,
+            next_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS);
+#else
+    (void)next_norm;
+#endif
+    return ds41_graph_after_moe(g);
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -42337,7 +42353,7 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
         g_expert_profile.active || getenv("DS4_CUDA_MOE_PROFILE") ||
         metal_graph_debug_get_config()->prefix ||
         !ds4_gpu_decode_graphs_supported())
-        return ds41_graph_layer(g, m, l, il, token);
+        return ds41_graph_layer(g, m, l, il, token, false, NULL);
     return ds41_decode_island(g, m, l, il, 0) &&
         ds41_attention(g, m, l, il, true) && ds41_decode_island(g, m, l, il, 2) &&
         ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
@@ -42454,8 +42470,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     const bool queue_layers = !g->imatrix && (g->tp_world == 2 ?
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE") : DS41_METAL && !layer_resident);
     const bool queue_logits = logits && queue_layers && g->tp_world == 1;
+    bool normed = false;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+        /* On Metal the next layer starts with its HC sum and norm, unless it
+         * first adds Engram rows or captures the residual. */
+        const ds4_tensor *next_norm = DS41_METAL && il + 1u < DS4_N_LAYER && g->tp_world < 2 &&
+            !g->streaming && !g->imatrix && !g->dspark && !ds41_engram_layer(il + 1u) ?
+            w->layer[il + 1u].attn_norm : NULL;
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         if (ok && ds41_engram_layer(il)) {
@@ -42465,9 +42487,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         }
         if (ok) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            (void)normed;
+            (void)next_norm;
             ok = ds41_graph_decode_layer(g, m, l, il, token);
 #else
-            ok = ds41_graph_layer(g, m, l, il, token);
+            ok = ds41_graph_layer(g, m, l, il, token, normed, next_norm);
+            normed = next_norm != NULL;
 #endif
         }
         /* TP gates already submit ordered, bounded command buffers; a single
@@ -43050,7 +43075,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 row.engram_rows_late = row.engram_rows;
                 ok = batch_attention ? ds41_graph_before_attention(&row, m, &w->layer[il], il) :
                     batch_moe ? ds41_graph_before_moe(&row, m, &w->layer[il], il) :
-                    ds41_graph_layer(&row, m, &w->layer[il], il, tokens[off + t]);
+                    ds41_graph_layer(&row, m, &w->layer[il], il, tokens[off + t], false, NULL);
             }
             if (ok && batch_attention) {
                 const ds4_layer_weights *l = &w->layer[il];

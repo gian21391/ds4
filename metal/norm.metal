@@ -92,7 +92,7 @@ template [[host_name("kernel_rms_norm_f32_4")]]     kernel kernel_rms_norm_fuse_
 template [[host_name("kernel_rms_norm_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 template [[host_name("kernel_dsv41_rms_norm_mul_bf16_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2, true>;
 
-// The norm half of the fused V4.1 HC sum + BF16 RMSNorm kernel below: the
+// The norm half of the fused V4.1 HC sum + BF16 RMSNorm kernels below: the
 // reduction of kernel_rms_norm_fuse_impl, then its BF16 weighted store of the
 // rows x each thread wrote.
 static inline void dsv41_hc_rms_norm_mul_bf16(
@@ -155,6 +155,59 @@ kernel void kernel_dsv41_hc_sum_rms_norm_mul_bf16_f32_4(
             acc += hc[h*args.ne00_t + i00] * w[h];
         }
         const float4 v = dsv41_bf16(acc);
+        x[i00] = v;
+        sumf += dot(v, v);
+    }
+    dsv41_hc_rms_norm_mul_bf16(args, sumf, x, norm_weight, dst, shmem_f32, tpitg, sgitg, tiisg, ntg);
+}
+
+// V4.1 decode layer boundary: the post-FFN HC=4 expand of block + BF16(add)
+// (as kernel_dsv4_hc_expand4 with bf16, including its FMA chain), then the
+// next layer's HC sum with pre = split[0:4] (also stored) and BF16 norm, as
+// kernel_dsv41_hc_sum_rms_norm_mul_bf16_f32_4. Each thread expands the four
+// dimensions it sums and reduces.
+kernel void kernel_dsv41_hc_expand_sum_rms_norm_mul_bf16_f32_4(
+        constant ds4_metal_args_norm & args,
+        device const float4 * block,
+        device const float4 * add,
+        device const float4 * residual,
+        device const float  * split,
+        device       float4 * out_hc,
+        device       float  * pre,
+        device       float4 * x,
+        device const float4 * norm_weight,
+        device       float4 * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+    if (tpitg.x < 4) {
+        pre[tpitg.x] = split[tpitg.x];
+    }
+
+    const int n4 = args.ne00_t;
+    device const float * post = split + 4;
+    device const float * comb = split + 8;
+    float sumf = 0.0f;
+    for (int i00 = tpitg.x; i00 < n4; i00 += ntg.x) {
+        const float4 b = dsv41_bf16(block[i00] + dsv41_bf16(add[i00]));
+        const float4 r0 = residual[i00], r1 = residual[n4 + i00];
+        const float4 r2 = residual[2*n4 + i00], r3 = residual[3*n4 + i00];
+        float4 acc_sum = 0.0f;
+        for (int h = 0; h < 4; ++h) {
+            float4 acc = fma(float4(comb[h]), r0, b * post[h]);
+            acc = fma(float4(comb[h + 4]), r1, acc);
+            acc = fma(float4(comb[h + 8]), r2, acc);
+            acc = fma(float4(comb[h + 12]), r3, acc);
+            const float4 o = dsv41_bf16(acc);
+            out_hc[h*n4 + i00] = o;
+            acc_sum += o * split[h];
+        }
+        const float4 v = dsv41_bf16(acc_sum);
         x[i00] = v;
         sumf += dot(v, v);
     }
