@@ -275,3 +275,12 @@ kernel void kernel_cpy_tile_rows_f32_f32(
     const uint r = (args.pos0 + t) % args.ratio;
     dst[gid] = src[r * args.width + e];
 }
+
+// Small tensor copy in the compute stream (ds4_gpu_tensor_copy).
+kernel void kernel_copy_u32(
+        constant uint &n,
+        device const uint *src,
+        device uint *dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < n) dst[gid] = src[gid];
+}
